@@ -1,0 +1,120 @@
+#include <stdio.h>
+
+__global__ void vectorAdd(float *A, float *B, float *C, int numberElements)
+{
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+
+    if(i < numberElements) {
+        C[i] = A[i] + B[i];
+    }
+}
+
+int main(void)
+{
+    // calculate the allocated size
+    int numberElements = 50;
+    size_t size = numberElements * sizeof(float);
+    cudaError_t err = cudaSuccess;
+
+    // allocate size in host
+    float *h_A = (float *)malloc(size);
+    float *h_B = (float *)malloc(size);
+    float *h_C = (float *)malloc(size);
+
+    // should set them to be 0 first
+    if(h_A!=NULL && h_B!=NULL && h_C!=NULL)
+    {
+        memset(h_A, 0, size);
+        memset(h_B, 0, size);
+        memset(h_C, 0, size);
+    } else {
+        fprintf(stderr, "Failed to allocate host vectors!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // random values
+    for(int i = 0; i < numberElements; i++)
+    {
+        h_A[i] = rand() / (float) RAND_MAX;
+        h_B[i] = rand() / (float) RAND_MAX;
+
+    }
+
+
+    // device allocate size
+    float *d_A,*d_B, *d_C;
+
+    err        = cudaMalloc((void **)&d_A, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    err        = cudaMalloc((void **)&d_B, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate device vector B (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    err        = cudaMalloc((void **)&d_C, size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to allocate device vector C (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    //transfer from host to device
+    err = cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to copy vector A from host to devive (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    err = cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to copy vector B from host to devive (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    err = cudaMemcpy(d_C, h_C, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to copy vector C from host to devive (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    // set the threads and block and transfer
+    int threadsPerBlock = 256;
+    int blockPerGrid = (numberElements + threadsPerBlock - 1) / threadsPerBlock;
+    printf("CUDA kernel launch with %d blocks of %d threads\n", blockPerGrid, threadsPerBlock);
+
+    vectorAdd<<<blockPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numberElements);
+
+    err = cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < numberElements; ++i) {
+        if (fabs(h_A[i] + h_B[i] - h_C[i]) > 1e-5) {
+            fprintf(stderr, "Result verification failed at element %d!\n", i);
+            exit(EXIT_FAILURE);
+        } else {
+        printf("idx = %2d\tA=%.2f\tB=%.2f\tresult=%.2f\n", i+1, h_A[i], h_B[i], h_C[i]);
+        }
+    }
+
+    printf("Test PASSED\n");
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
+
+    printf("Done\n");
+    return 0;
+
+
+
+}
