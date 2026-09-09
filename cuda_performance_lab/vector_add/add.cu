@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include "../errorCheck/errorCheckFunction.cuh"
 
 __global__ void vectorAdd(float *A, float *B, float *C, int numberElements)
 {
@@ -12,7 +13,7 @@ __global__ void vectorAdd(float *A, float *B, float *C, int numberElements)
 int main(void)
 {
     // calculate the allocated size
-    int numberElements = 50;
+    int numberElements = 5000;
     size_t size = numberElements * sizeof(float);
     cudaError_t err = cudaSuccess;
 
@@ -82,11 +83,15 @@ int main(void)
     }
 
     // set the threads and block and transfer
-    int threadsPerBlock = 256;
+    int threadsPerBlock = 2048;
     int blockPerGrid = (numberElements + threadsPerBlock - 1) / threadsPerBlock;
     printf("CUDA kernel launch with %d blocks of %d threads\n", blockPerGrid, threadsPerBlock);
 
     vectorAdd<<<blockPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numberElements);
+
+    ErrorCheck(cudaGetLastError(), __FILE__, __LINE__ );
+    ErrorCheck(cudaDeviceSynchronize(), __FILE__, __LINE__ );
+
 
     err = cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
