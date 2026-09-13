@@ -1,0 +1,22 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/common.cuh
+stdlib.h
+-
+stdio.h
+-
+
+/root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/global_memory.cu
+cuda_runtime.h
+-
+iostream
+-
+common.cuh
+/root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/common.cuh
+

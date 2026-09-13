@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/build",
+  "command": "/usr/local/cuda/bin/nvcc      -std=c++14 -x cu -c /root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/global_memory.cu -o CMakeFiles/global_memory.dir/global_memory.cu.o",
+  "file": "/root/autodl-tmp/my-cuda-code/cuda_performance_lab/memory/global_memory.cu"
+}
+]
