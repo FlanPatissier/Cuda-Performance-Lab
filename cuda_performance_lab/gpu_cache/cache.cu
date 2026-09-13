@@ -2,15 +2,11 @@
 #include <iostream>
 #include "common.cuh"
 
-__constant__ float c_data;
-__constant__ float c_data2 = 6.6f;
 
-__global__ void kernel_1(void)
+__global__ void kernel(void)
 {
     
-    printf("Constant data c_data = %.2f.\n", c_data);
 }
-
 
 
 int main(int argc, char **argv)
@@ -21,15 +17,19 @@ int main(int argc, char **argv)
     CUDA_CHECK(cudaGetDeviceProperties(&deviceProps, devID));
     std::cout << "运行GPU设备:" << deviceProps.name << std::endl;
 
-    float h_data = 8.8f;
-    CUDA_CHECK(cudaMemcpyToSymbol(c_data, &h_data, sizeof(float)));
+    if (deviceProps.globalL1CacheSupported){
+        std::cout << "支持全局内存L1缓存" << std::endl;
+    }
+    else{
+        std::cout << "不支持全局内存L1缓存" << std::endl;
+    }
+    std::cout << "L2缓存大小：" << deviceProps.l2CacheSize / (1024 * 1024) << "M" << std::endl;
 
     dim3 block(1);
     dim3 grid(1);
-    kernel_1<<<grid, block>>>();
+    kernel<<<grid, block>>>();
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpyFromSymbol(&h_data, c_data2, sizeof(float)));
-    printf("Constant data h_data = %.2f.\n", h_data);
+    
 
     CUDA_CHECK(cudaDeviceReset());
 
