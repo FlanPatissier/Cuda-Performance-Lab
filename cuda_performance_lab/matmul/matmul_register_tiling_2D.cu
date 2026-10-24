@@ -6,11 +6,29 @@
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
-#define BLOCKSIZE 32
-// 每个线程在行方向（M 方向）负责的输出元素个数
-#define TM 4
-// 每个线程在列方向（N 方向）负责的输出元素个数
-#define TN 4
+// ---------------------------------------------------------------------------
+//   BM : block tile 在 M 方向输出行数
+//   BN : block tile 在 N 方向输出列数
+//   BK : K 方向每次 shared-memory 迭代深度
+//   TM : 每线程 M 方向输出行数
+//   TN : 每线程 N 方向输出列数
+//
+// 约束：
+//   (BM*BN) % (TM*TN) == 0     -> number_threads
+//   BM % TM == 0, BN % TN == 0
+//   number_threads % BK == 0   -> stride_A 整除
+//   number_threads % BN == 0   -> stride_B 整除
+// ---------------------------------------------------------------------------
+#define BM 128
+#define BN 128
+#define BK 16
+#define TM 8
+#define TN 8
+
+#define NUM_THREADS ((BM * BN) / (TM * TN))   // 256
+#define THREAD_COLS (BN / TN)                 // 16
+#define STRIDE_A    (NUM_THREADS / BK)
+#define STRIDE_B    (NUM_THREADS / BN)
 
 #define CUDA_CHECK(call)                                           \
     do                                                             \
@@ -24,149 +42,157 @@
     } while (0)
 
 // ---------------------------------------------------------------------------
-// 二维 Thread Tile 版本
-// 一个 block 负责 C 中 (BLOCKSIZE * TM) x (BLOCKSIZE * TN) 的一块子矩阵
-// block 内使用 BLOCKSIZE * BLOCKSIZE 个线程（一维组织）
-// 每个线程负责一个 TM x TN 的小块
+// 二维 Thread Tile + 五参数解耦版本
+//   - 加载索引（inner_row_*/inner_col_*/stride_*）与计算坐标解耦
+//   - BM/BN/BK/TM/TN 独立可调，M/N 方向 tile 可不对称
 // ---------------------------------------------------------------------------
 __global__ void matmul_shared_2d_tile_kernel(
-    const float* A,
-    const float* B,
-    float* C,
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M,
     int N,
     int K)
 {
-    // 当前 block 负责的输出块坐标
-    const int cRow = blockIdx.y;
-    const int cCol = blockIdx.x;
+    // -----------------------------------------------------------------------
+    // Block 索引
+    // -----------------------------------------------------------------------
+    const uint c_row = blockIdx.y;
+    const uint c_col = blockIdx.x;
 
-    // 将一维 threadIdx.x 拆成 (threadRow, threadCol)
-    // threadCol 取低位，保证同一个 warp 内 threadCol 连续
-    const int threadCol = threadIdx.x % BLOCKSIZE;
-    const int threadRow = threadIdx.x / BLOCKSIZE;
+    // -----------------------------------------------------------------------
+    // Thread 索引（用于计算）：把 block tile 按 (BN/TN) 列切分
+    // -----------------------------------------------------------------------
+    const uint thread_col = threadIdx.x % THREAD_COLS;
+    const uint thread_row = threadIdx.x / THREAD_COLS;
 
-    // 该线程负责的 TM x TN 小块中，左上角元素的全局坐标
-    const int gRow = cRow * BLOCKSIZE * TM + threadRow * TM;
-    const int gCol = cCol * BLOCKSIZE * TN + threadCol * TN;
+    // -----------------------------------------------------------------------
+    // 加载索引（与计算坐标解耦，扁平展开）
+    //   A tile: BM x BK , 行宽 BK
+    //   B tile: BK x BN , 行宽 BN
+    // -----------------------------------------------------------------------
+    const uint inner_row_A = threadIdx.x / BK;   // [0, BM)
+    const uint inner_col_A = threadIdx.x % BK;   // [0, BK)
 
-    // 共享内存缓存块
-    // As: (BLOCKSIZE * TM) x BLOCKSIZE
-    // Bs: BLOCKSIZE x (BLOCKSIZE * TN)
-    __shared__ float As[BLOCKSIZE * TM * BLOCKSIZE];
-    __shared__ float Bs[BLOCKSIZE * BLOCKSIZE * TN];
+    const uint inner_row_B = threadIdx.x / BN;   // [0, BK)
+    const uint inner_col_B = threadIdx.x % BN;   // [0, BN)
 
-    // 推进 A 指针到当前 block 对应的起始位置
-    A += cRow * BLOCKSIZE * TM * K;   // 行 = cRow 块，列 = 0
-    // 推进 B 指针到当前 block 对应的起始位置
-    B += cCol * BLOCKSIZE * TN;       // 行 = 0，列 = cCol 块
-    // 推进 C 指针到当前 block 对应的起始位置
-    C += cRow * BLOCKSIZE * TM * N + cCol * BLOCKSIZE * TN;
+    // -----------------------------------------------------------------------
+    // 该线程负责的 TM x TN 输出小块左上角全局坐标
+    // -----------------------------------------------------------------------
+    const uint gRow = c_row * BM + thread_row * TM;
+    const uint gCol = c_col * BN + thread_col * TN;
 
-    // 每个线程维护 TM x TN 个部分和
+    // -----------------------------------------------------------------------
+    // 共享内存
+    // -----------------------------------------------------------------------
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
+
+    // 把 A/B/C 指针推进到当前 block 的起始位置
+    A += c_row * BM * K;   // 行偏移，列从 0 起（每次迭代再加 bkIdx）
+    B += c_col * BN;       // 列偏移，行从 0 起（每次迭代再加 bkIdx*N）
+    C += c_row * BM * N + c_col * BN;
+
+    // -----------------------------------------------------------------------
+    // 每线程 TM x TN 累加器
+    // -----------------------------------------------------------------------
     float tmp[TM][TN];
+    #pragma unroll
     for (int i = 0; i < TM; ++i)
-    {
+        #pragma unroll
         for (int j = 0; j < TN; ++j)
-        {
             tmp[i][j] = 0.0f;
-        }
-    }
 
-    // 外层循环沿 K 方向推进
-    for (int bkIdx = 0; bkIdx < K; bkIdx += BLOCKSIZE)
+    // -----------------------------------------------------------------------
+    // 沿 K 方向迭代
+    // -----------------------------------------------------------------------
+    for (int bkIdx = 0; bkIdx < K; bkIdx += BK)
     {
-        // -------------------------------------------------------------------
-        // 1. 把 A 的一个 (BLOCKSIZE * TM) x BLOCKSIZE 块搬进共享内存
-        //    每个线程负责搬运 TM 个元素（沿 M 方向）
-        //    As 的布局：行优先，行宽 = BLOCKSIZE
-        // -------------------------------------------------------------------
-        for (int i = 0; i < TM; ++i)
+        // ---- 1) 加载 A 的 BM x BK tile ----
+        //     每个线程搬 (BM / STRIDE_A) 个元素（沿 M 方向跨行）
+        #pragma unroll
+        for (uint offset = 0; offset < BM; offset += STRIDE_A)
         {
-            const int aRow = threadRow + i * BLOCKSIZE;
+            const uint aRow = inner_row_A + offset;
+            const uint aCol = inner_col_A;
 
-            As[aRow * BLOCKSIZE + threadCol] =
-                (gRow + i * BLOCKSIZE < M && bkIdx + threadCol < K)
-                    ? A[aRow * K + threadCol]
-                    : 0.0f;
+            const bool valid =
+                (c_row * BM + aRow < (uint)M) &&
+                (bkIdx + (int)aCol < K);
+
+            As[aRow * BK + aCol] =
+                valid ? A[aRow * K + aCol] : 0.0f;
         }
 
-        // -------------------------------------------------------------------
-        // 2. 把 B 的一个 BLOCKSIZE x (BLOCKSIZE * TN) 块搬进共享内存
-        //    每个线程负责搬运 TN 个元素（沿 N 方向）
-        //    Bs 的布局：行优先，行宽 = BLOCKSIZE * TN
-        // -------------------------------------------------------------------
-        for (int j = 0; j < TN; ++j)
+        // ---- 2) 加载 B 的 BK x BN tile ----
+        //     每个线程搬 (BK / STRIDE_B) 个元素（沿 K 方向跨行）
+        #pragma unroll
+        for (uint offset = 0; offset < BK; offset += STRIDE_B)
         {
-            const int bCol = threadCol + j * BLOCKSIZE;
+            const uint bRow = inner_row_B + offset;
+            const uint bCol = inner_col_B;
 
-            Bs[threadRow * (BLOCKSIZE * TN) + bCol] =
-                (bkIdx + threadRow < K && gCol + j * BLOCKSIZE < N)
-                    ? B[threadRow * N + bCol]
-                    : 0.0f;
+            const bool valid =
+                (bkIdx + (int)bRow < K) &&
+                (c_col * BN + bCol < (uint)N);
+
+            Bs[bRow * BN + bCol] =
+                valid ? B[bRow * N + bCol] : 0.0f;
         }
 
-        // 等所有线程都完成共享内存写入
         __syncthreads();
 
-        // -------------------------------------------------------------------
-        // 3. 在当前缓存块上做部分点积
-        //    每个线程从 As 读 TM 个元素、从 Bs 读 TN 个元素，
-        //    做 TM x TN 次乘加，A 和 B 的读取都只在寄存器层面复用
-        // -------------------------------------------------------------------
-        for (int dotIdx = 0; dotIdx < BLOCKSIZE; ++dotIdx)
+        // ---- 3) 在当前 tile 上做外积累加 ----
+        #pragma unroll
+        for (int dotIdx = 0; dotIdx < BK; ++dotIdx)
         {
-            // 从 As 取出该线程负责的 TM 个 A 元素
+            // 取 TM 个 A 元素
             float aReg[TM];
+            #pragma unroll
             for (int i = 0; i < TM; ++i)
-            {
-                aReg[i] = As[(threadRow + i * BLOCKSIZE) * BLOCKSIZE + dotIdx];
-            }
+                aReg[i] = As[(thread_row * TM + i) * BK + dotIdx];
 
-            // 从 Bs 取出该线程负责的 TN 个 B 元素
+            // 取 TN 个 B 元素
             float bReg[TN];
+            #pragma unroll
             for (int j = 0; j < TN; ++j)
-            {
-                bReg[j] = Bs[dotIdx * (BLOCKSIZE * TN) + threadCol + j * BLOCKSIZE];
-            }
+                bReg[j] = Bs[dotIdx * BN + thread_col * TN + j];
 
-            // 做 TM x TN 次外积累加
+            // TM x TN 外积
+            #pragma unroll
             for (int i = 0; i < TM; ++i)
-            {
+                #pragma unroll
                 for (int j = 0; j < TN; ++j)
-                {
                     tmp[i][j] += aReg[i] * bReg[j];
-                }
-            }
         }
 
-        // 再同步一次，防止跑得快的线程提前覆盖还在被读的共享内存
         __syncthreads();
 
-        // 推进指针到下一个块
-        A += BLOCKSIZE;
-        B += BLOCKSIZE * N;
+        // 推进到下一个 K tile
+        A += BK;
+        B += BK * N;
     }
 
     // -----------------------------------------------------------------------
-    // 4. 写回结果
-    //    每个线程写 TM x TN 个元素
+    // 写回 C
     // -----------------------------------------------------------------------
+    #pragma unroll
     for (int i = 0; i < TM; ++i)
     {
+        #pragma unroll
         for (int j = 0; j < TN; ++j)
         {
-            if (gRow + i * BLOCKSIZE < M && gCol + j * BLOCKSIZE < N)
-            {
-                C[(threadRow + i * BLOCKSIZE) * N + threadCol + j * BLOCKSIZE] =
-                    tmp[i][j];
-            }
+            const uint row = gRow + i;
+            const uint col = gCol + j;
+            if (row < (uint)M && col < (uint)N)
+                C[(thread_row * TM + i) * N + (thread_col * TN + j)] = tmp[i][j];
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// CPU 参考实现
+// CPU 参考实现（不变）
 // ---------------------------------------------------------------------------
 void cpu_matmul(
     const float* A,
@@ -193,7 +219,7 @@ void cpu_matmul(
 }
 
 // ---------------------------------------------------------------------------
-// 最大误差
+// 最大误差（不变）
 // ---------------------------------------------------------------------------
 float max_error(const float* C, const float* C_ref, int size)
 {
@@ -264,13 +290,13 @@ int main()
     const int repeat = 20;
     double flops = 2.0 * M * N * K;
 
-    // 注意：grid 在 M/N 方向的划分要按 BLOCKSIZE * TM / BLOCKSIZE * TN 来算
-    dim3 gridDim(CEIL_DIV(N, BLOCKSIZE * TN), CEIL_DIV(M, BLOCKSIZE * TM));
+    // grid 按 BM/BN 划分
+    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
 
     // 7. 二维 Thread Tile 版本
     {
-        // block 内仍然使用 BLOCKSIZE * BLOCKSIZE 个线程（一维）
-        dim3 blockDim(BLOCKSIZE * BLOCKSIZE);
+        // block 内线程数 = BM*BN/(TM*TN)
+        dim3 blockDim(NUM_THREADS);
 
         matmul_shared_2d_tile_kernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, N, K);
         CUDA_CHECK(cudaGetLastError());
@@ -292,7 +318,8 @@ int main()
 
         CUDA_CHECK(cudaMemcpy(h_C, d_C, bytesC, cudaMemcpyDeviceToHost));
 
-        printf("2d tile: %8.3f ms, %7.2f GFLOPS, max error = %e\n",
+        printf("2d tile (BM=%d BN=%d BK=%d TM=%d TN=%d): %8.3f ms, %7.2f GFLOPS, max error = %e\n",
+               BM, BN, BK, TM, TN,
                ms,
                flops / (ms * 1e6),
                max_error(h_C, h_C_ref, M * N));
