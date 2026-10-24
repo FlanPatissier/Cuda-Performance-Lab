@@ -59,16 +59,16 @@ __global__ void matmul_shared_kernel(
     int K)
 {
     // 当前 block 负责的输出块坐标
-    const int cRow = blockIdx.y;
-    const int cCol = blockIdx.x;
+    const int cRow = blockIdx.y; 
+    const int cCol = blockIdx.x; 
 
     // threadCol 取 threadIdx.x 的低位，保证同一个 warp 内 threadCol 连续
-    const int threadCol = threadIdx.x % BLOCKSIZE;
-    const int threadRow = threadIdx.x / BLOCKSIZE;
+    const int threadCol = threadIdx.x % BLOCKSIZE; 
+    const int threadRow = threadIdx.x / BLOCKSIZE; 
 
     // 该线程最终负责的 C 元素的全局坐标
-    const int gRow = cRow * BLOCKSIZE + threadRow;
-    const int gCol = cCol * BLOCKSIZE + threadCol;
+    const int gRow = cRow * BLOCKSIZE + threadRow; 
+    const int gCol = cCol * BLOCKSIZE + threadCol; 
 
     __shared__ float As[BLOCKSIZE * BLOCKSIZE];
     __shared__ float Bs[BLOCKSIZE * BLOCKSIZE];
