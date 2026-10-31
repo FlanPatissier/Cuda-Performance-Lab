@@ -1,0 +1,353 @@
+// RUN: triton-opt %s -split-input-file -canonicalize | FileCheck %s
+
+// CHECK-LABEL: @false_store_predicates
+// CHECK-NEXT: tt.store %arg0, %arg1, %arg2 :
+// CHECK-NEXT: tt.atomic_store release, gpu, %arg0, %arg1, %arg2 :
+// CHECK-NEXT: tt.return
+tt.func @false_store_predicates(%ptr: !tt.ptr<i32>, %value: i32, %pred: i1, %ptrs: tensor<4x!tt.ptr<i32>>, %values: tensor<4xi32>) {
+  %false = arith.constant false
+  // m_Zero matches both scalar false and dense<false> tensor masks.
+  %mask = arith.constant dense<false> : tensor<4xi1>
+  tt.store %ptr, %value, %false : !tt.ptr<i32>
+  tt.atomic_store release, gpu, %ptr, %value, %false : !tt.ptr<i32>
+  tt.store %ptrs, %values, %mask : tensor<4x!tt.ptr<i32>>
+  tt.atomic_store release, gpu, %ptrs, %values, %mask : tensor<4x!tt.ptr<i32>>
+  tt.store %ptr, %value, %pred : !tt.ptr<i32>
+  tt.atomic_store release, gpu, %ptr, %value, %pred : !tt.ptr<i32>
+  tt.return
+}
+
+// -----
+
+// CHECK-LABEL: @load_false_mask_with_other
+// CHECK-NEXT: tt.return %arg1 : i32
+tt.func @load_false_mask_with_other(%ptr: !tt.ptr<i32>, %other: i32) -> i32 {
+  %false = arith.constant false
+  %value = tt.load %ptr, %false, %other : !tt.ptr<i32>
+  tt.return %value : i32
+}
+
+// -----
+
+// CHECK-LABEL: @load_true_mask
+// CHECK-NEXT: %[[VALUE:.*]] = tt.load %arg0 : !tt.ptr<i32>
+// CHECK-NEXT: tt.return %[[VALUE]] : i32
+tt.func @load_true_mask(%ptr: !tt.ptr<i32>) -> i32 {
+  %true = arith.constant true
+  %value = tt.load %ptr, %true : !tt.ptr<i32>
+  tt.return %value : i32
+}
+
+// -----
+
+// CHECK-LABEL: dead_load
+tt.func @dead_load(%ptr: tensor<32x128x!tt.ptr<f16>>) {
+  %mask = arith.constant dense<true> : tensor<32x128xi1>
+  %other = arith.constant dense<0.00e+00> : tensor<32x128xf16>
+  // CHECK-NOT: tt.load {{.*}}isVolatile = false
+  //     CHECK: tt.load {{.*}}isVolatile = true
+  %a = tt.load %ptr, %mask, %other : tensor<32x128x!tt.ptr<f16>>
+  %b = tt.load %ptr, %mask, %other {isVolatile = true} : tensor<32x128x!tt.ptr<f16>>
+  tt.return
+}
+
+// -----
+
+// CHECK-LABEL: dead_atomic_load
+tt.func @dead_atomic_load(%ptr: !tt.ptr<i32>) {
+  // Atomic loads remain observable synchronization operations when unused.
+  // CHECK: tt.atomic_load acquire, gpu
+  %unused = tt.atomic_load acquire, gpu, %ptr : (!tt.ptr<i32>) -> i32
+  tt.return
+}
+
+// -----
+
+// CHECK-LABEL: make_range
+tt.func @make_range() -> (tensor<128x1xi32>, tensor<1xi32>) {
+  // CHECK-DAG: %[[c:.*]] = arith.constant dense<0> : tensor<128x1xi32>
+  %a = tt.make_range {end = 1 : i32, start = 0 : i32} : tensor<1xi32>
+  %b = tt.expand_dims %a {axis = 1 : i32} : tensor<1xi32> -> tensor<1x1xi32>
+  %c = tt.broadcast %b : tensor<1x1xi32> -> tensor<128x1xi32>
+
+  // CHECK-DAG: %[[d:.*]] = arith.constant dense<1> : tensor<1xi32>
+  %d = tt.make_range {end = 2 : i32, start = 1 : i32} : tensor<1xi32>
+
+  // CHECK-DAG: tt.return %[[c]], %[[d]] : tensor<128x1xi32>, tensor<1xi32>
+  tt.return %c, %d : tensor<128x1xi32>, tensor<1xi32>
+}
+
+// -----
+
+// CHECK-LABEL: fold_addptr
+tt.func @fold_addptr(%arg: tensor<64x64x!tt.ptr<f16>>) -> (tensor<64x64x!tt.ptr<f16>>) {
+  // CHECK-NOT: tt.addptr
+  // CHECK-NOT: arith.constant
+  //     CHECK: tt.return %arg
+  %c0_i32 = arith.constant dense<0> : tensor<64x64xi32>
+  %0 = tt.addptr %arg, %c0_i32 : tensor<64x64x!tt.ptr<f16>>, tensor<64x64xi32>
+  tt.return %0 : tensor<64x64x!tt.ptr<f16>>
+}
+
+// -----
+
+// CHECK-LABEL: fold_addptr_scalar
+tt.func @fold_addptr_scalar(%arg: !tt.ptr<f16>) -> (!tt.ptr<f16>) {
+  // CHECK-NOT: tt.addptr
+  // CHECK-NOT: arith.constant
+  //     CHECK: tt.return %arg
+  %c0_i32 = arith.constant 0 : i32
+  %0 = tt.addptr %arg, %c0_i32 : !tt.ptr<f16>, i32
+  tt.return %0 : !tt.ptr<f16>
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [32, 1], warpsPerCTA = [1, 1], order = [0, 1]}>
+#sliced0 = #ttg.slice<{dim = 1, parent = #blocked0}>
+
+// CHECK-LABEL: fn
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+tt.func @fn(%arg0: tensor<1xf32, #sliced0>) -> (tensor<32x1xf32, #blocked0>){
+  // CHECK: %[[a:.*]] = tt.expand_dims
+  // CHECK: tt.broadcast %[[a]]
+  %a = tt.broadcast %arg0 : tensor<1xf32, #sliced0> -> tensor<32xf32, #sliced0>
+  %b = tt.expand_dims %a {axis = 1 : i32} : tensor<32xf32, #sliced0> -> tensor<32x1xf32, #blocked0>
+  tt.return %b : tensor<32x1xf32, #blocked0>
+}
+}  // end module
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fp_to_fp_pos_zero_fold() -> tensor<32x128xf8E4M3FNUZ, #blocked> {
+    // CHECK-LABEL: fp_to_fp_pos_zero_fold
+    // CHECK-NEXT: %[[cst_folded:.+]] = arith.constant dense<0.000000e+00> : tensor<32x128xf8E4M3FNUZ, #blocked>
+    // CHECK-NEXT: tt.return %[[cst_folded]]
+    %cst = arith.constant dense<0.00e+00> : tensor<32x128xf32, #blocked>
+    %cst_converted = tt.fp_to_fp %cst, rounding = rtne : tensor<32x128xf32, #blocked> -> tensor<32x128xf8E4M3FNUZ, #blocked>
+    tt.return %cst_converted : tensor<32x128xf8E4M3FNUZ, #blocked>
+  }
+}  // end module
+
+// -----
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fp_to_fp_pos_zero_fold_scalar() -> f8E4M3FNUZ {
+    // CHECK-LABEL: fp_to_fp_pos_zero_fold_scalar
+    // CHECK-NEXT: %[[cst_folded:.+]] = arith.constant 0.000000e+00 : f8E4M3FNUZ
+    // CHECK-NEXT: tt.return %[[cst_folded]]
+    %cst = arith.constant 0.00e+00 : f32
+    %cst_converted = tt.fp_to_fp %cst, rounding = rtne : f32 -> f8E4M3FNUZ
+    tt.return %cst_converted : f8E4M3FNUZ
+  }
+}  // end module
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fp_to_fp_neg_zero_fold() -> tensor<32x128xf8E4M3FN, #blocked> {
+    // CHECK-LABEL: fp_to_fp_neg_zero_fold
+    // CHECK-NEXT: %[[cst_folded:.+]] = arith.constant dense<-0.000000e+00> : tensor<32x128xf8E4M3FN, #blocked>
+    // CHECK-NEXT: tt.return %[[cst_folded]]
+    %cst = arith.constant dense<-0.00e+00> : tensor<32x128xf32, #blocked>
+    %cst_converted = tt.fp_to_fp %cst, rounding = rtne : tensor<32x128xf32, #blocked> -> tensor<32x128xf8E4M3FN, #blocked>
+    tt.return %cst_converted : tensor<32x128xf8E4M3FN, #blocked>
+  }
+}  // end module
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fp_to_fp_neg_zero_fold() -> tensor<32x128xf8E4M3FNUZ, #blocked> {
+    // CHECK-LABEL: fp_to_fp_neg_zero_fold
+    // We fold to the positive zero here given by definition f8E4M3FNUZ does not have negative zero encoding.
+    // CHECK-NEXT: %[[cst_folded:.+]] = arith.constant dense<0.000000e+00> : tensor<32x128xf8E4M3FNUZ, #blocked>
+    // CHECK-NEXT: tt.return %[[cst_folded]]
+    %cst = arith.constant dense<-0.00e+00> : tensor<32x128xf32, #blocked>
+    %cst_converted = tt.fp_to_fp %cst, rounding = rtne : tensor<32x128xf32, #blocked> -> tensor<32x128xf8E4M3FNUZ, #blocked>
+    tt.return %cst_converted : tensor<32x128xf8E4M3FNUZ, #blocked>
+  }
+}  // end module
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fold_fp_to_fp_non_zero_nofold() -> tensor<32x128xf8E4M3FNUZ, #blocked> {
+    // CHECK-LABEL: fold_fp_to_fp_non_zero_nofold
+    // CHECK-NEXT: %[[cst:.+]] = arith.constant dense<0xFF800000> : tensor<32x128xf32, #blocked>
+    // CHECK-NEXT: %[[cst_cvt:.+]] = tt.fp_to_fp %[[cst]]
+    // CHECK-NEXT: tt.return %[[cst_cvt]]
+    %cst = arith.constant dense<0xFF800000> : tensor<32x128xf32, #blocked>
+    %cst_converted = tt.fp_to_fp %cst, rounding = rtne : tensor<32x128xf32, #blocked> -> tensor<32x128xf8E4M3FNUZ, #blocked>
+    tt.return %cst_converted : tensor<32x128xf8E4M3FNUZ, #blocked>
+  }
+}  // end module
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func @fold_fp_to_fp_non_constant_nofold(%arg0: tensor<32x128xf32, #blocked>) -> tensor<32x128xf8E4M3FNUZ, #blocked> {
+    // CHECK-LABEL: fold_fp_to_fp_non_constant_nofold
+    // CHECK-NEXT: %[[arg_cvt:.+]] = tt.fp_to_fp %arg0
+    // CHECK-NEXT: tt.return %[[arg_cvt]]
+    %cst_converted = tt.fp_to_fp %arg0, rounding = rtne : tensor<32x128xf32, #blocked> -> tensor<32x128xf8E4M3FNUZ, #blocked>
+    tt.return %cst_converted : tensor<32x128xf8E4M3FNUZ, #blocked>
+  }
+}  // end module
+
+// -----
+
+// CHECK-LABEL: @fold_broadcast_constant_pattern
+tt.func @fold_broadcast_constant_pattern(%cst : f32) -> tensor<8x2xf32> {
+    // CHECK: %[[cst:.*]] = arith.constant dense<1.000000e+00> : tensor<8x2xf32>
+    %const = arith.constant dense<1.0> : tensor<8x1xf32>
+    %bst_out = tt.broadcast %const : tensor<8x1xf32> -> tensor<8x2xf32>
+
+    // CHECK-NEXT: tt.return %[[cst]] : tensor<8x2xf32>
+    tt.return %bst_out : tensor<8x2xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @fold_transpose_constant
+tt.func @fold_transpose_constant() -> tensor<128x16xf32> {
+    // CHECK: %[[cst:.*]] = arith.constant dense<1.000000e+00> : tensor<128x16xf32>
+    %cst = arith.constant dense<1.0> : tensor<16x128xf32>
+    %r = tt.trans %cst {order = array<i32: 1, 0>} : tensor<16x128xf32> -> tensor<128x16xf32>
+    // CHECK-NEXT: tt.return %[[cst]] : tensor<128x16xf32>
+    tt.return %r : tensor<128x16xf32>
+}
+// -----
+
+// CHECK-LABEL: @canonicalize_int_to_ptr_of_ptr_to_int
+// Test: int_to_ptr(ptr_to_int(ptr)) -> ptr (round-trip elimination)
+tt.func @canonicalize_int_to_ptr_of_ptr_to_int(%ptr: tensor<64x!tt.ptr<f32>>) -> tensor<64x!tt.ptr<f32>> {
+  // CHECK-NOT: tt.ptr_to_int
+  // CHECK-NOT: tt.int_to_ptr
+  // CHECK-NOT: tt.bitcast
+  // CHECK: tt.return %{{.*}} : tensor<64x!tt.ptr<f32>>
+  %int = tt.ptr_to_int %ptr : tensor<64x!tt.ptr<f32>> -> tensor<64xi64>
+  %result = tt.int_to_ptr %int : tensor<64xi64> -> tensor<64x!tt.ptr<f32>>
+  tt.return %result : tensor<64x!tt.ptr<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: @canonicalize_int_to_ptr_of_ptr_to_int_with_different_ptr_type
+tt.func @canonicalize_int_to_ptr_of_ptr_to_int_with_different_ptr_type(%ptr: !tt.ptr<f32>) -> !tt.ptr<f16> {
+  // CHECK-NOT: tt.ptr_to_int
+  // CHECK-NOT: tt.int_to_ptr
+  // CHECK: %[[RESULT:.*]] = tt.bitcast %{{.*}} : !tt.ptr<f32> -> !tt.ptr<f16>
+  %int = tt.ptr_to_int %ptr : !tt.ptr<f32> -> i64
+  %result = tt.int_to_ptr %int : i64 -> !tt.ptr<f16>
+  // CHECK-NEXT: tt.return %[[RESULT]] : !tt.ptr<f16>
+  tt.return %result : !tt.ptr<f16>
+}
+
+// -----
+
+// CHECK-LABEL: @canonicalize_int_to_ptr_with_constant_offset_f32
+// Test: int_to_ptr(addi(ptr_to_int(ptr), constant)) -> addptr(ptr, element_offset)
+// For f32 (4 bytes): 16 bytes = 4 elements
+tt.func @canonicalize_int_to_ptr_with_constant_offset_f32(%base: tensor<128x!tt.ptr<f32>>) -> tensor<128x!tt.ptr<f32>> {
+  // CHECK: %[[OFFSET:.*]] = arith.constant dense<4> : tensor<128xi64>
+  // CHECK-NEXT: %[[RESULT:.*]] = tt.addptr %{{.*}}, %[[OFFSET]] : tensor<128x!tt.ptr<f32>>, tensor<128xi64>
+  %byte_offset = arith.constant dense<16> : tensor<128xi64>
+  %ptr_as_int = tt.ptr_to_int %base : tensor<128x!tt.ptr<f32>> -> tensor<128xi64>
+  %offset_ptr_int = arith.addi %ptr_as_int, %byte_offset : tensor<128xi64>
+  %result = tt.int_to_ptr %offset_ptr_int : tensor<128xi64> -> tensor<128x!tt.ptr<f32>>
+  // CHECK-NEXT: tt.return %[[RESULT]] : tensor<128x!tt.ptr<f32>>
+  tt.return %result : tensor<128x!tt.ptr<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: @canonicalize_int_to_ptr_with_constant_offset_f16
+// Test: For f16 (2 bytes): 32 bytes = 16 elements
+tt.func @canonicalize_int_to_ptr_with_constant_offset_f16(%base: tensor<1024x!tt.ptr<f16>>) -> tensor<1024x!tt.ptr<f16>> {
+  // CHECK: %[[OFFSET:.*]] = arith.constant dense<16> : tensor<1024xi64>
+  // CHECK-NEXT: %[[RESULT:.*]] = tt.addptr %{{.*}}, %[[OFFSET]] : tensor<1024x!tt.ptr<f16>>, tensor<1024xi64>
+  %byte_offset = arith.constant dense<32> : tensor<1024xi64>
+  %ptr_as_int = tt.ptr_to_int %base : tensor<1024x!tt.ptr<f16>> -> tensor<1024xi64>
+  %offset_ptr_int = arith.addi %ptr_as_int, %byte_offset : tensor<1024xi64>
+  %result = tt.int_to_ptr %offset_ptr_int : tensor<1024xi64> -> tensor<1024x!tt.ptr<f16>>
+  // CHECK-NEXT: tt.return %[[RESULT]] : tensor<1024x!tt.ptr<f16>>
+  tt.return %result : tensor<1024x!tt.ptr<f16>>
+}
+
+// -----
+
+// CHECK-LABEL: @no_canonicalize_non_constant_offset
+// Test: Non-constant offsets should not be canonicalized
+tt.func @no_canonicalize_non_constant_offset(%base: tensor<128x!tt.ptr<f32>>, %offset: tensor<128xi64>) -> tensor<128x!tt.ptr<f32>> {
+  // CHECK: tt.ptr_to_int
+  // CHECK-NEXT: arith.addi
+  // CHECK-NEXT: tt.int_to_ptr
+  %ptr_as_int = tt.ptr_to_int %base : tensor<128x!tt.ptr<f32>> -> tensor<128xi64>
+  %offset_ptr_int = arith.addi %ptr_as_int, %offset : tensor<128xi64>
+  %result = tt.int_to_ptr %offset_ptr_int : tensor<128xi64> -> tensor<128x!tt.ptr<f32>>
+  tt.return %result : tensor<128x!tt.ptr<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: @no_canonicalize_indivisible_offset
+// Test: Offset not divisible by element size should not be canonicalized
+tt.func @no_canonicalize_indivisible_offset(%base: tensor<128x!tt.ptr<f32>>) -> tensor<128x!tt.ptr<f32>> {
+  // 7 bytes is not divisible by 4 (size of f32)
+  // CHECK: tt.ptr_to_int
+  // CHECK-NEXT: arith.addi
+  // CHECK-NEXT: tt.int_to_ptr
+  %byte_offset = arith.constant dense<7> : tensor<128xi64>
+  %ptr_as_int = tt.ptr_to_int %base : tensor<128x!tt.ptr<f32>> -> tensor<128xi64>
+  %offset_ptr_int = arith.addi %ptr_as_int, %byte_offset : tensor<128xi64>
+  %result = tt.int_to_ptr %offset_ptr_int : tensor<128xi64> -> tensor<128x!tt.ptr<f32>>
+  tt.return %result : tensor<128x!tt.ptr<f32>>
+}
+
+// -----
+
+// CHECK-LABEL: split_join
+tt.func @split_join(%a: tensor<8x4xf32>, %b: tensor<8x4xf32>) -> (tensor<8x4xf32>, tensor<8x4xf32>) {
+  // split(join(a, b)) -> (a, b)
+  // CHECK-NOT: tt.join
+  // CHECK-NOT: tt.split
+  // CHECK: tt.return %arg0, %arg1
+  %j = tt.join %a, %b : tensor<8x4xf32> -> tensor<8x4x2xf32>
+  %o:2 = tt.split %j : tensor<8x4x2xf32> -> tensor<8x4xf32>
+  tt.return %o#0, %o#1 : tensor<8x4xf32>, tensor<8x4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: join_split
+tt.func @join_split(%x: tensor<8x4x2xf32>) -> tensor<8x4x2xf32> {
+  // join(split(x)[0], split(x)[1]) -> x
+  // CHECK-NOT: tt.split
+  // CHECK-NOT: tt.join
+  // CHECK: tt.return %arg0
+  %s:2 = tt.split %x : tensor<8x4x2xf32> -> tensor<8x4xf32>
+  %j = tt.join %s#0, %s#1 : tensor<8x4xf32> -> tensor<8x4x2xf32>
+  tt.return %j : tensor<8x4x2xf32>
+}
+
+// -----
+
+// CHECK-LABEL: split_join_folds_through_discardable_attr
+tt.func @split_join_folds_through_discardable_attr(%a: tensor<8x4xf32>, %b: tensor<8x4xf32>) -> (tensor<8x4xf32>, tensor<8x4xf32>) {
+  // The fold is a pure algebraic identity and is intentionally agnostic to
+  // discardable attributes (e.g. a warp-specialization async_task_id): the
+  // round-trip is removed and the original operands flow through.
+  // CHECK-NOT: tt.join
+  // CHECK-NOT: tt.split
+  // CHECK: tt.return %arg0, %arg1
+  %j = tt.join %a, %b : tensor<8x4xf32> -> tensor<8x4x2xf32>
+  %o:2 = tt.split %j {async_task_id = array<i32: 0>} : tensor<8x4x2xf32> -> tensor<8x4xf32>
+  tt.return %o#0, %o#1 : tensor<8x4xf32>, tensor<8x4xf32>
+}

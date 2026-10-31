@@ -1,0 +1,85 @@
+/*
+ * Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files
+ * (the "Software"), to deal in the Software without restriction,
+ * including without limitation the rights to use, copy, modify, merge,
+ * publish, distribute, sublicense, and/or sell copies of the Software,
+ * and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#ifndef TRITON_THIRD_PARTY_AMD_INCLUDE_DIALECT_TRITONAMDGPU_IR_DIALECT_H_
+#define TRITON_THIRD_PARTY_AMD_INCLUDE_DIALECT_TRITONAMDGPU_IR_DIALECT_H_
+
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dialect.h"
+#include "mlir/IR/PatternMatch.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Traits.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
+
+namespace mlir::triton::amd {
+struct L2Cache : public SideEffects::Resource::Base<L2Cache> {
+  StringRef getName() const final { return "<AMDGPU::L2Cache>"; }
+};
+} // namespace mlir::triton::amd
+
+namespace mlir::triton::amdgpu {
+/// Returns the number of dwords for a TDM tensor descriptor based on rank.
+/// 2D tensors: group0 (4) + group1 (8) = 12 dwords
+/// 3D-5D tensors: group0 (4) + group1 (8) + group2 (4) + group3 (4) = 20 dwords
+inline int getTensorDescNumDwords(triton::TensorDescType type) {
+  auto shape = type.getShape();
+  return (shape.size() > 2) ? (4 + 8 + 4 + 4) : (4 + 8);
+}
+
+/// Derives the scale layout an fp4 scaled upcast requires from the layout of
+/// its output. `scaleShape` must have the same rank as the output and match it
+/// on every dimension but `axis`, where it must divide the output extent. The
+/// result is canonical: broadcast (zero) register bases are dropped so a thread
+/// keeps one register per distinct scale value.
+FailureOr<triton::LinearLayout> inferScaledUpcastFp4ScaleLayout(
+    const triton::LinearLayout &outputLL, ArrayRef<int64_t> scaleShape,
+    int64_t axis, function_ref<InFlightDiagnostic()> emitError = nullptr);
+} // namespace mlir::triton::amdgpu
+
+// clang-format off
+#include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h.inc"
+#include "amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUEnums.h.inc"
+// clang-format on
+
+#define GET_ATTRDEF_CLASSES
+#include "amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUAttrDefs.h.inc"
+
+#define GET_TYPEDEF_CLASSES
+#include "amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUTypes.h.inc"
+
+namespace mlir::triton::amdgpu {
+/// The element type accessed through the base of a buffer op: the pointee of
+/// a scalar pointer or the element type of a buffer descriptor.
+Type getBufferElementType(Type base);
+/// Whether `value`'s element type matches the element type of buffer base
+/// `base` (a scalar pointer or a buffer descriptor).
+bool elementTypeMatchesBufferBase(Type value, Type base);
+} // namespace mlir::triton::amdgpu
+
+#include "amd/include/Dialect/TritonAMDGPU/IR/TritonAMDGPUOpInterfaces.h.inc"
+#define GET_OP_CLASSES
+#include "amd/include/Dialect/TritonAMDGPU/IR/Ops.h.inc"
+
+#endif // TRITON_THIRD_PARTY_AMD_INCLUDE_DIALECT_TRITONAMDGPU_IR_DIALECT_H_

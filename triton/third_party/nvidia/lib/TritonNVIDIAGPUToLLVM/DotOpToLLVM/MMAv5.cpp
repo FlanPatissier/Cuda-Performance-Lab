@@ -1,0 +1,1034 @@
+#include "Dialect/NVGPU/IR/Dialect.h"
+#include "MMAHelpers.h"
+#include "PatternTritonGPUOpToLLVM.h"
+#include "Utility.h"
+#include "mlir/Support/LLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/NvmmaSmemAttrs.h"
+
+#include <array>
+#include <bit>
+
+using namespace mlir;
+using namespace mlir::triton;
+using namespace mlir::triton::gpu;
+using namespace mlir::triton::NVIDIA;
+namespace ttng = mlir::triton::nvidia_gpu;
+
+namespace {
+
+// Helper class to load tensor memory following MMAv5 layout.
+class DotOpMmaV5TmemLoader : public DotOpMmaMemLoader {
+public:
+  static DotOpMmaV5TmemLoader build(Location loc, RewriterBase &rewriter,
+                                    mlir::triton::gpu::MemDescType memTy,
+                                    Value tmemBase,
+                                    unsigned logicalElementBitWidth) {
+    // We take the full layout even when it is a subview
+    // We'll just iterate the real shape when calling tmemLoad tho
+    unsigned storageElementBitWidth = memTy.getElementTypeBitWidth();
+    assert(logicalElementBitWidth > 0 &&
+           storageElementBitWidth % logicalElementBitWidth == 0 &&
+           "logical element bit width must divide TMEM storage bit width");
+    auto tb = TritonLLVMOpBuilder(loc, rewriter);
+    Value address = tb.ptrtoint(i32_ty, tmemBase);
+
+    auto llInv = toLinearLayout(memTy).pseudoinvert();
+    return DotOpMmaV5TmemLoader(llInv, address, storageElementBitWidth,
+                                logicalElementBitWidth);
+  }
+
+  MemDescOperand tmemLoad(int a, int b, ConversionPatternRewriter &rewriter,
+                          Location loc) const {
+    // MMAv5 supplies a logical K coordinate, while byte-backed FP4 memdescs
+    // use packed K coordinates. This applies to both dense and fp4Padded FP4;
+    // the memdesc layout handles any additional physical padding.
+    unsigned packingFactor = storageElementBitWidth / logicalElementBitWidth;
+    assert(b % packingFactor == 0 &&
+           "logical K coordinate must be aligned to packed storage");
+    b /= packingFactor;
+    auto dims = to_vector(ll.getInDimNames());
+    auto rowCol = ll.apply({{dims[0], a}, {dims[1], b}});
+    int row = rowCol[0].second;
+    int col = rowCol[1].second * storageElementBitWidth / 32;
+    int offset = col | (row << 16);
+    return {address, offset};
+  }
+
+  MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
+                         Location loc, int kSize = 0) const override {
+    return tmemLoad(a, b, rewriter, loc);
+  }
+
+private:
+  DotOpMmaV5TmemLoader(LinearLayout ll, Value address,
+                       int storageElementBitWidth, int logicalElementBitWidth)
+      : ll(std::move(ll)), address(address),
+        storageElementBitWidth(storageElementBitWidth),
+        logicalElementBitWidth(logicalElementBitWidth) {}
+
+  LinearLayout ll;
+  Value address;
+  int storageElementBitWidth;
+  int logicalElementBitWidth;
+};
+
+//===----------------------------------------------------------------------===//
+// InstDescriptor
+//===----------------------------------------------------------------------===//
+
+enum class mxfpKind { mxf8f6f4 = 0, mxf4 = 1, mxf4nvf4 = 2 };
+enum class scaleKind : uint32_t { ue4m3 = 0, e8m0 = 1, ue5m3 = 2 };
+
+bool isTransposed(Value operand) {
+  auto tensorTy = cast<MemDescType>(operand.getType());
+  if (isa<ttng::TensorMemoryEncodingAttr>(tensorTy.getEncoding()))
+    return false;
+
+  auto attrs = ttng::getNvmmaSmemAttrs(tensorTy);
+  assert(attrs && "expected MMAv5 shared operand to have NVMMA SMEM attrs");
+  return attrs->transposed;
+}
+
+bool isFp4Padded(MemDescType operand) {
+  // An fp4Padded TMEM descriptor keeps the packed Mx(K/2)xi8 shape. Allocate
+  // two physical columns per packed K coordinate so each logical FP4 element
+  // occupies one byte in TMEM.
+  if (auto tmemLayout =
+          dyn_cast<ttng::TensorMemoryEncodingAttr>(operand.getEncoding()))
+    return tmemLayout.getFp4Padded();
+  auto attrs = ttng::getNvmmaSmemAttrs(operand);
+  assert(attrs && "expected MMAv5 shared operand to have NVMMA SMEM attrs");
+  return attrs->fp4Padded;
+}
+
+static int getScaleVecSize(ttng::TCGen5MMAScaledOp op) {
+  int blockK = op.getBlockK();
+  int64_t scaleCols = op.getAScale().getType().getShape().back();
+  assert(blockK % scaleCols == 0);
+  return blockK / scaleCols;
+}
+
+static bool isBlock16Scale(MemDescType scaleType, int blockK) {
+  return scaleType.getShape().back() * 16 == blockK;
+}
+
+inline mxfpKind getMXFPKind(ScaleDotElemType typeA, ScaleDotElemType typeB,
+                            MemDescType scaleAType, MemDescType scaleBType,
+                            int blockK, bool transpose) {
+  if (typeA == ScaleDotElemType::E2M1 && typeB == ScaleDotElemType::E2M1) {
+    auto scaleAElemType = scaleAType.getElementType();
+    auto scaleBElemType = scaleBType.getElementType();
+    bool isUE4M3 = llvm::isa<Float8E4M3FNType>(scaleAElemType) &&
+                   llvm::isa<Float8E4M3FNType>(scaleBElemType);
+    bool isUE5M3 = scaleAElemType.isInteger(8) && scaleBElemType.isInteger(8) &&
+                   isBlock16Scale(scaleAType, blockK) &&
+                   isBlock16Scale(scaleBType, blockK);
+    if (isUE4M3 || isUE5M3)
+      return mxfpKind::mxf4nvf4;
+    if (!transpose)
+      return mxfpKind::mxf4;
+  }
+  return mxfpKind::mxf8f6f4;
+};
+
+static scaleKind getScaleKind(ttng::TCGen5MMAScaledOp op, int blockK) {
+  auto scaleType = op.getAScale().getType();
+  Type elemType = scaleType.getElementType();
+  if (llvm::isa<Float8E4M3FNType>(elemType))
+    return scaleKind::ue4m3;
+  if (elemType.isInteger(8) && isBlock16Scale(scaleType, blockK))
+    return scaleKind::ue5m3;
+  return scaleKind::e8m0;
+}
+
+static Value createInstDescriptor(ConversionPatternRewriter &rewriter,
+                                  ttng::TCGen5MMAOp op, int M, int N,
+                                  bool transposeA, bool transposeB, int kSize) {
+  Location loc = op.getLoc();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  // Name reserved fields so bit_cast never reads padding bits.
+  struct TCGen5InstructionDescriptor {
+    uint32_t sparsitySelector : 2;
+    uint32_t sparsity : 1;
+    uint32_t reserved0 : 1;
+    uint32_t dType : 2;
+    uint32_t reserved1 : 1;
+    uint32_t aType : 3;
+    uint32_t bType : 3;
+    uint32_t negateA : 1;
+    uint32_t negateB : 1;
+    uint32_t transposeA : 1;
+    uint32_t transposeB : 1;
+    uint32_t N : 6;
+    uint32_t reserved2 : 1;
+    uint32_t M : 5;
+    uint32_t kSize : 1;
+    uint32_t shift : 2;
+  };
+  auto getTypeEncoding = [&](Type type) {
+    if (type.isF16())
+      return 0;
+    if (type.isBF16())
+      return 1;
+    if (type.isF32())
+      return 2;
+    if (llvm::isa<Float8E4M3FNType>(type))
+      return 0;
+    if (llvm::isa<Float8E5M2Type>(type))
+      return 1;
+    // For 8-bit integer types, signed arithmetic is 1, unsigned arithmetic is
+    // 0.
+    if (type.isInteger(8))
+      return op.getIsUnsigned() ? 0 : 1;
+    llvm_unreachable("Unsupported type.");
+  };
+  static_assert(sizeof(TCGen5InstructionDescriptor) == 4,
+                "instruction descriptor size should be 32 bits.");
+  TCGen5InstructionDescriptor desc{};
+  desc.transposeA = transposeA;
+  desc.transposeB = transposeB;
+  desc.M = M >> 4;
+  desc.N = N >> 3;
+  desc.aType = getTypeEncoding(op.getA().getType().getElementType());
+  desc.bType = getTypeEncoding(op.getB().getType().getElementType());
+  Type dstElType = op.getD().getType().getElementType();
+  if (dstElType.isInteger(32)) {
+    desc.dType = 2;
+  } else {
+    desc.dType = dstElType.isF16() ? 0 : 1;
+  }
+  if (kSize == 64)
+    desc.kSize = 1;
+
+  return b.int_val(32, std::bit_cast<uint32_t>(desc));
+}
+
+static Value createScaleInstDescriptorFp8(ConversionPatternRewriter &rewriter,
+                                          ttng::TCGen5MMAScaledOp op, int M,
+                                          int N, bool transposeA,
+                                          bool transposeB,
+                                          int scaleFactorsubIdxA,
+                                          int scaleFactorsubIdxB, int kSize) {
+  Location loc = op.getLoc();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  struct TCGen5InstructionDescriptor {
+    uint32_t sparsitySelector : 2;
+    uint32_t sparsity : 1;
+    uint32_t reserved0 : 1;
+    uint32_t BScaleFactor : 2;
+    uint32_t reserved1 : 1;
+    uint32_t aType : 3;
+    uint32_t bType : 3;
+    uint32_t negateA : 1;
+    uint32_t negateB : 1;
+    uint32_t transposeA : 1;
+    uint32_t transposeB : 1;
+    uint32_t N : 6;
+    uint32_t scaleType : 2;
+    uint32_t M : 4;
+    uint32_t AScaleFactor : 2;
+    uint32_t kSize : 1;
+  };
+  auto getTypeEncoding = [](ScaleDotElemType type) {
+    switch (type) {
+    case ScaleDotElemType::E4M3:
+      return 0;
+    case ScaleDotElemType::E5M2:
+      return 1;
+    case ScaleDotElemType::E2M3:
+      return 3;
+    case ScaleDotElemType::E3M2:
+      return 4;
+    case ScaleDotElemType::E2M1:
+      return 5;
+    default:
+      break;
+    }
+    llvm_unreachable("Unsupported type.");
+  };
+  static_assert(sizeof(TCGen5InstructionDescriptor) == 4,
+                "instruction descriptor size should be 32 bits.");
+  TCGen5InstructionDescriptor desc{};
+  desc.transposeA = transposeA;
+  desc.transposeB = transposeB;
+  desc.M = M >> 5;
+  desc.N = N >> 3;
+  desc.aType = getTypeEncoding(op.getAType());
+  desc.bType = getTypeEncoding(op.getBType());
+  desc.AScaleFactor = scaleFactorsubIdxA;
+  desc.BScaleFactor = scaleFactorsubIdxB;
+  desc.scaleType = 1; // E8M0
+
+  assert(kSize == 32 || kSize == 64);
+  if (kSize == 64) {
+    desc.kSize = 1;
+    desc.AScaleFactor *= 2;
+    desc.BScaleFactor *= 2;
+  }
+
+  return b.int_val(32, std::bit_cast<uint32_t>(desc));
+}
+
+static Value createScaleInstDescriptorFp4(
+    ConversionPatternRewriter &rewriter, ttng::TCGen5MMAScaledOp op, int M,
+    int N, bool transposeA, bool transposeB, int scaleFactorsubIdxA,
+    int scaleFactorsubIdxB, mxfpKind mxfpInstKind, int blockK, int kSize) {
+  Location loc = op.getLoc();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  struct TCGen5InstructionDescriptor {
+    uint32_t sparsitySelector : 2;
+    uint32_t sparsity : 1;
+    uint32_t kSizeUpper : 1;
+    uint32_t BScaleFactor : 2;
+    uint32_t reserved0 : 1;
+    uint32_t aType : 3;
+    uint32_t bType : 2;
+    uint32_t reserved1 : 1;
+    uint32_t negateA : 1;
+    uint32_t negateB : 1;
+    uint32_t transposeA : 1;
+    uint32_t transposeB : 1;
+    uint32_t N : 6;
+    uint32_t scaleType : 2;
+    uint32_t M : 4;
+    uint32_t AScaleFactor : 2;
+    uint32_t kSizeLower : 1;
+  };
+  static_assert(sizeof(TCGen5InstructionDescriptor) == 4,
+                "instruction descriptor size should be 32 bits.");
+  TCGen5InstructionDescriptor desc{};
+  desc.transposeA = transposeA;
+  desc.transposeB = transposeB;
+  desc.M = M >> 5;
+  desc.N = N >> 3;
+  desc.aType = 1;
+  desc.bType = 1;
+  desc.AScaleFactor = scaleFactorsubIdxA;
+  desc.BScaleFactor = scaleFactorsubIdxB;
+  desc.scaleType = static_cast<uint32_t>(getScaleKind(op, blockK));
+
+  assert(kSize == 64 || kSize == 96 || kSize == 128);
+  if (kSize == 96) {
+    // K96 selectors are byte offsets into three (block32) or six (block16)
+    // consecutive scales, including across scale words.
+    desc.kSizeLower = 1;
+    return b.int_val(32, std::bit_cast<uint32_t>(desc));
+  }
+  if (kSize == 128) {
+    desc.kSizeUpper = 1;
+  }
+
+  assert(desc.AScaleFactor <= 1 && desc.BScaleFactor <= 1);
+  assert(desc.transposeA == 0 &&
+         "MMAv5 with kind=mxf4 does not support transpose");
+  assert(desc.transposeB == 0 &&
+         "MMAv5 with kind=mxf4 does not support transpose");
+
+  int scaleVecSize = getScaleVecSize(op);
+  if (mxfpInstKind == mxfpKind::mxf4 || (mxfpInstKind == mxfpKind::mxf4nvf4 &&
+                                         scaleVecSize == 32 && kSize == 64)) {
+    desc.AScaleFactor *= 2;
+    desc.BScaleFactor *= 2;
+    assert(desc.AScaleFactor == 0 || desc.AScaleFactor == 2 &&
+                                         "MMAv5 with kind=mxf4 or "
+                                         "kind=mxf4nvf4 and .block32 only "
+                                         "supports SFA_ID 0 or 2");
+    assert(desc.BScaleFactor == 0 || desc.BScaleFactor == 2 &&
+                                         "MMAv5 with kind=mxf4 or "
+                                         "kind=mxf4nvf4 and .block32 only "
+                                         "supports SFB_ID 0 or 2");
+  } else if (mxfpInstKind == mxfpKind::mxf4nvf4) {
+    assert(desc.AScaleFactor == 0 &&
+           "MMAv5 with kind=mxf4nvf4 and .block16 only supports SFA_ID 0");
+    assert(desc.BScaleFactor == 0 &&
+           "MMAv5 with kind=mxf4nvf4 and .block16 only supports SFB_ID 0");
+  }
+
+  return b.int_val(32, std::bit_cast<uint32_t>(desc));
+}
+
+//===----------------------------------------------------------------------===//
+// tcgen05 instructions
+//===----------------------------------------------------------------------===//
+
+enum class CollectorAction { None, Fill, Use, Lastuse };
+
+struct OperandReuse {
+  CollectorAction a = CollectorAction::None;
+  CollectorAction b = CollectorAction::None;
+};
+
+struct MMAInstOperands {
+  Value descriptor;
+  Value scaleA;
+  Value scaleB;
+};
+
+std::string getCollectorModifier(CollectorAction reuse, StringRef operand) {
+  StringRef action;
+  switch (reuse) {
+  case CollectorAction::None:
+    return "";
+  case CollectorAction::Fill:
+    action = "fill";
+    break;
+  case CollectorAction::Use:
+    action = "use";
+    break;
+  case CollectorAction::Lastuse:
+    action = "lastuse";
+    break;
+  }
+  return ".collector::" + operand.str() + "::" + action.str();
+}
+
+void createGen5MMA(ConversionPatternRewriter &rewriter, Location loc,
+                   StringRef kind, MemDescOperand a, Value b, MemDescOperand d,
+                   Value pred, const MMAInstOperands &inst, Value useInitAcc,
+                   bool twoCTAs, OperandReuse reuse) {
+  PTXBuilder ptxBuilder;
+  std::string opcode =
+      "tcgen05.mma.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
+      ".kind::" + kind.str() + getCollectorModifier(reuse.a, "a") +
+      getCollectorModifier(reuse.b, "b");
+  auto *accOp = ptxBuilder.newAddrOperand(d.base, "r", *d.offset);
+  auto *aOp = a.offset ? ptxBuilder.newAddrOperand(a.base, "r", *a.offset)
+                       : ptxBuilder.newOperand(a.base, "l");
+  auto *bOp = ptxBuilder.newOperand(b, "l");
+  auto *instDescOp = ptxBuilder.newOperand(inst.descriptor, "r");
+  SmallVector<PTXBuilder::Operand *> operands{accOp, aOp, bOp, instDescOp};
+  assert(bool(inst.scaleA) == bool(inst.scaleB));
+  if (inst.scaleA) {
+    operands.push_back(ptxBuilder.newAddrOperand(inst.scaleA, "r"));
+    operands.push_back(ptxBuilder.newAddrOperand(inst.scaleB, "r"));
+  }
+  operands.push_back(ptxBuilder.newOperand(useInitAcc, "b"));
+  auto &mmaOp = *ptxBuilder.create(opcode);
+  mmaOp(operands).predicate(pred);
+  ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
+}
+
+void createMMACommit(ConversionPatternRewriter &rewriter, Location loc,
+                     Value barrier, Value pred, bool twoCTAs,
+                     ValueRange descs) {
+  PTXBuilder ptxBuilder;
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value mask;
+  for (uint16_t broadcastBits : ttng::getCTABroadcastMasks(twoCTAs, descs)) {
+    Value descMask =
+        LLVM::NVIDIA::createTMAMulticastMask(loc, rewriter, broadcastBits);
+    mask = mask ? b.or_(descMask, mask) : descMask;
+  }
+
+  SmallVector<PTXBuilder::Operand *> ptxOperands;
+  auto *predOperand = ptxBuilder.newOperand(pred, "b");
+  ptxOperands.push_back(predOperand);
+  barrier = b.ptrtoint(i32_ty, barrier);
+  auto *barrierOperand = ptxBuilder.newOperand(barrier, "r");
+  ptxOperands.push_back(barrierOperand);
+  std::string opcode =
+      "@$0 tcgen05.commit.cta_group::" + std::to_string(twoCTAs ? 2 : 1) +
+      ".mbarrier::arrive::one.shared::cluster";
+  if (mask)
+    opcode += ".multicast::cluster";
+  opcode += ".b64 [$1]";
+  if (mask) {
+    opcode += ", $2";
+    auto *maskOperand = ptxBuilder.newOperand(mask, "h");
+    ptxOperands.push_back(maskOperand);
+  }
+  opcode += ";";
+  auto &barrierOp = *ptxBuilder.create(opcode);
+  barrierOp(ptxOperands, /*onlyAttachMLIRArgs=*/true);
+  ptxBuilder.launch(rewriter, loc, void_ty(rewriter.getContext()));
+}
+
+//===----------------------------------------------------------------------===//
+// MMAv5 Conversion
+//===----------------------------------------------------------------------===//
+
+// Information about how to lower a dot operation, shared between regular and
+// scaled dot.
+struct DotConversion {
+  struct InstDesc {
+    // For 2CTA mode, the M dimension in the instruction descriptor must be
+    // doubled to match the hardware's expectation for cta_group::2 operations.
+    unsigned mmaSizeM;
+    unsigned mmaSizeN;
+    struct {
+      int numRepM;
+      int numRepN;
+      int numRepK;
+    } repShape;
+    bool transA;
+    bool transB;
+  };
+
+  using GetInstOperandsFn =
+      std::function<MMAInstOperands(const InstDesc &, int, int, int)>;
+
+  unsigned blockK;
+  int mmaSizeK;
+  SmallVector<int> kOffsets;
+
+  int getKOffset(int k) const {
+    return kOffsets.empty() ? k * mmaSizeK : kOffsets[k];
+  }
+
+  int getKSize(int k) const { return getKOffset(k + 1) - getKOffset(k); }
+
+  int numBitsPerElementA;
+  int numBitsPerElementB;
+  StringRef kind;
+  GetInstOperandsFn getInstOperands;
+};
+
+LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
+                             ConversionPatternRewriter &rewriter, Location loc,
+                             Value a, Value b, Value loadedA, Value loadedB,
+                             MemDescType dTensorTy, Value loadedD,
+                             Value useDFlag, Value pred, ValueRange barriers,
+                             ValueRange barrierPreds, bool twoCTAs,
+                             ValueRange commitDescs,
+                             const ttng::TargetFeatures &targetFeatures,
+                             const DotConversion &op) {
+  auto tb = TritonLLVMOpBuilder(loc, rewriter);
+  auto dLoader = DotOpMmaV5TmemLoader::build(
+      loc, rewriter, dTensorTy, loadedD, dTensorTy.getElementTypeBitWidth());
+
+  // Only run mma on one thread. We currently use elect as ptxas is not able to
+  // detect that tid.x == 0 is true only for 1 thread.
+  Value warpId = mlir::triton::gpu::WarpIdOp::create(rewriter, loc);
+  Value isWarp0 = tb.icmp_eq(warpId, tb.i32_val(0));
+  if (twoCTAs) {
+    Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
+    pred = tb.and_(pred, cluster0);
+  }
+  pred = tb.and_(pred, isWarp0);
+
+  // Wrap the whole mma code sequence within a IF block.
+  auto *curBlock = rewriter.getInsertionBlock();
+  auto *endBlock = curBlock->splitBlock(rewriter.getInsertionPoint());
+  auto *mmaBlock = rewriter.createBlock(curBlock->getParent(),
+                                        std::next(Region::iterator(curBlock)));
+  rewriter.setInsertionPointToEnd(curBlock);
+  LLVM::CondBrOp::create(rewriter, loc, pred, mmaBlock, endBlock);
+  // Emit the rest in mmaBlock
+  rewriter.setInsertionPointToEnd(mmaBlock);
+
+  Value elect = LLVM::NVIDIA::createElectPredicate(loc, rewriter);
+
+  auto aTensorTy = cast<MemDescType>(a.getType());
+  auto bTensorTy = cast<MemDescType>(b.getType());
+  bool aInTmem = isa<ttng::TensorMemoryEncodingAttr>(aTensorTy.getEncoding());
+
+  Value baseA = loadedA;
+  if (!aInTmem) {
+    baseA = getOffsetedBase(loadedA, aTensorTy, &typeConverter, rewriter, loc);
+  }
+  Value baseB =
+      getOffsetedBase(loadedB, bTensorTy, &typeConverter, rewriter, loc);
+
+  // Use per-CTA shape to correctly handle 2-CTA mode. getBlockM/N() returns
+  // the full block shape (e.g., 256 for 2-CTA), but we need the per-CTA shape
+  // (e.g., 128) to compute the correct number of MMA repetitions.
+  SmallVector<int64_t> dstPerCTA = triton::gpu::getShapePerCTA(dTensorTy);
+  unsigned M = dstPerCTA[0];
+  unsigned N = dstPerCTA[1];
+  unsigned K = op.blockK;
+
+  auto tensorMemAttr =
+      cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
+  unsigned mmaSizeM = tensorMemAttr.getBlockM();
+  unsigned mmaSizeN = ttng::getMMAv5InstructionN(dTensorTy);
+  unsigned mmaSizeK = op.mmaSizeK;
+  int numRepM = ceil<unsigned>(M, mmaSizeM);
+  int numRepN = ceil<unsigned>(N, mmaSizeN);
+  int numRepK = op.kOffsets.empty() ? ceil<unsigned>(K, mmaSizeK)
+                                    : op.kOffsets.size() - 1;
+
+  // In A * B = C
+  // For M=64 twoCTAs, B and C have the same split and A has a split half of C
+  // along M.
+  SmallVector<unsigned> aOperandShape = {mmaSizeM, mmaSizeK};
+  // For M=128 twoCTAs, A and C have the same split and B has a split half of C
+  // along N.
+  SmallVector<unsigned> bOperandShape = {mmaSizeK,
+                                         mmaSizeN / (twoCTAs ? 2 : 1)};
+
+  std::unique_ptr<DotOpMmaMemLoader> aLoader;
+  bool transA = false;
+  auto isFp4a = op.numBitsPerElementA == 4;
+  if (aInTmem) {
+    aLoader =
+        std::make_unique<DotOpMmaV5TmemLoader>(DotOpMmaV5TmemLoader::build(
+            loc, rewriter, aTensorTy, baseA, op.numBitsPerElementA));
+  } else {
+    auto loader = DotOpMmaSmemLoader::build(loc, rewriter, aTensorTy, baseA,
+                                            aOperandShape, 0, 5, isFp4a);
+    if (failed(loader)) {
+      return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
+                                  "operand A in shared memory ")
+             << aTensorTy << " for MMAv5 instruction shape [" << mmaSizeM
+             << ", " << mmaSizeK << "]";
+    }
+    transA = loader->getDescriptor().transposed;
+    aLoader = std::make_unique<DotOpMmaSmemLoader>(std::move(*loader));
+  }
+
+  auto isFp4b = op.numBitsPerElementB == 4;
+  auto bLoader = DotOpMmaSmemLoader::build(loc, rewriter, bTensorTy, baseB,
+                                           bOperandShape, 1, 5, isFp4b);
+  if (failed(bLoader)) {
+    return mlir::emitError(loc, "failed to find valid tcgen05.mma layout for "
+                                "operand B in shared memory ")
+           << bTensorTy << " for MMAv5 instruction shape [" << mmaSizeK << ", "
+           << mmaSizeN << "]";
+  }
+  bool transB = !bLoader->getDescriptor().transposed;
+
+  // mmaSizeM/N is the per-cta size M/N, while the 2CTA instruction expects
+  // the 2CTA size mmaSize is always 64 / 128 so we double it for 2CTA
+  DotConversion::InstDesc desc{twoCTAs ? mmaSizeM * 2 : mmaSizeM,
+                               mmaSizeN,
+                               {numRepM, numRepN, numRepK},
+                               transA,
+                               transB};
+
+  // B reuse requires M = 128 for 1CTA or 256 for 2CTA, which corresponds to
+  // the condition mmaSizeM == 128 here
+  bool reuseB =
+      numRepM == 2 && mmaSizeM == 128 && targetFeatures.supportsReuseB();
+  // With A-only reuse, keep one A tile in the collector across the N tiles.
+  // Interleaving N inside K preserves the accumulation order and the first-K
+  // useD flag for every destination tile. Reuse is opportunistic, so A remains
+  // live until the whole MMA operation completes, just as on the non-reuse
+  // path. The same lifetime rule applies to B when both collectors are used.
+  // M=64 uses half the datapath and can interleave N tiles across TMEM lane
+  // alignments 0 and 16. A collector cannot be reused across that change.
+  bool reuseA =
+      mmaSizeM == 128 && numRepN > 1 && targetFeatures.supportsReuseA();
+  bool reuseBoth = reuseA && reuseB;
+
+  // Dimensions are M, N, K. Keep the original traversal when neither
+  // collector is used, and put the reused operand's other dimension innermost.
+  std::array<int, 3> numReps{numRepM, numRepN, numRepK};
+  std::array<int, 3> order = reuseB   ? std::array{1, 2, 0}
+                             : reuseA ? std::array{0, 2, 1}
+                                      : std::array{0, 1, 2};
+  if (reuseBoth) {
+    // Keep the more expensive source tile across the inner sweep, and reuse
+    // the other source at each turn. Count physical storage: FP4 can be packed
+    // or byte-padded, and FP6 also occupies byte-sized containers. There is no
+    // measured SMEM-versus-TMEM weighting here; equal sizes retain B priority.
+    auto storageBits = [](MemDescType ty, int logicalBits) {
+      return logicalBits == 4 && !isFp4Padded(ty) ? 4u
+                                                  : ty.getElementTypeBitWidth();
+    };
+    uint64_t aTileBits = uint64_t(aOperandShape[0]) * aOperandShape[1] *
+                         storageBits(aTensorTy, op.numBitsPerElementA);
+    uint64_t bTileBits = uint64_t(bOperandShape[0]) * bOperandShape[1] *
+                         storageBits(bTensorTy, op.numBitsPerElementB);
+    order = aTileBits > bTileBits ? std::array{2, 0, 1} : std::array{2, 1, 0};
+  }
+  auto getIndices = [&](int64_t index) {
+    std::array<int, 3> indices;
+    for (int dim : llvm::reverse(order)) {
+      indices[dim] = index % numReps[dim];
+      index /= numReps[dim];
+    }
+    // With both collectors, K is outermost and each M/N sweep reverses
+    // direction. Adjacent sweeps then share one operand at their boundary.
+    if (reuseBoth && indices[order[1]] % 2)
+      indices[order[2]] = numReps[order[2]] - 1 - indices[order[2]];
+    return indices;
+  };
+
+  // A is identified by (m, k), and B by (n, k). Derive each collector action
+  // from adjacent instructions so every reuse chain has a fill and a lastuse.
+  const std::array<int, 3> noIndices{-1, -1, -1};
+  auto previous = noIndices;
+  int64_t numMmas = int64_t(numRepM) * numRepN * numRepK;
+  for (int64_t i = 0; i < numMmas; ++i) {
+    auto indices = getIndices(i);
+    auto next = i + 1 < numMmas ? getIndices(i + 1) : noIndices;
+    auto getReuse = [&](bool enabled, int dim) {
+      if (!enabled)
+        return CollectorAction::None;
+      bool prevMatch =
+          indices[dim] == previous[dim] && indices[2] == previous[2];
+      bool nextMatch = indices[dim] == next[dim] && indices[2] == next[2];
+      return prevMatch
+                 ? (nextMatch ? CollectorAction::Use : CollectorAction::Lastuse)
+                 : (nextMatch ? CollectorAction::Fill : CollectorAction::None);
+    };
+    OperandReuse reuse{getReuse(reuseA, 0), getReuse(reuseB, 1)};
+    auto [m, n, k] = indices;
+    MemDescOperand accAddress =
+        dLoader.tmemLoad(m * mmaSizeM, n * mmaSizeN, rewriter, loc);
+    MemDescOperand a = aLoader->memLoad(m * aOperandShape[0], op.getKOffset(k),
+                                        rewriter, loc, op.getKSize(k));
+    Value b = bLoader->smemLoad(op.getKOffset(k), n * bOperandShape[1],
+                                rewriter, loc, op.getKSize(k));
+    Value useInitAcc = k == 0 ? useDFlag : tb.i1_val(1);
+    createGen5MMA(rewriter, loc, op.kind, a, b, accAddress, elect,
+                  op.getInstOperands(desc, m, n, k), useInitAcc, twoCTAs,
+                  reuse);
+    previous = indices;
+  }
+
+  for (auto [barrier, barrierPred] : llvm::zip(barriers, barrierPreds)) {
+    Value commitPred = tb.and_(barrierPred, elect);
+    auto smemObj =
+        LLVM::getSharedMemoryObjectFromStruct(loc, barrier, i64_ty, rewriter);
+    createMMACommit(rewriter, loc, smemObj.getBase(), commitPred, twoCTAs,
+                    commitDescs);
+  }
+  LLVM::BrOp::create(rewriter, loc, endBlock);
+  return success();
+}
+
+LogicalResult convertDot(const LLVMTypeConverter &typeConverter,
+                         ConversionPatternRewriter &rewriter, Location loc,
+                         ttng::TCGen5MMAOp op,
+                         ttng::TCGen5MMAOpAdaptor &adaptor,
+                         const ttng::TargetFeatures &targetFeatures) {
+  MemDescType aTensorTy = op.getA().getType();
+  MemDescType bTensorTy = op.getB().getType();
+  MemDescType dTensorTy = op.getD().getType();
+  bool twoCTAs = ttng::getModuleTwoCTAs(op);
+  assert(twoCTAs == op.getTwoCtas());
+  SmallVector<Value> commitDescs = op.getCompletionDescs();
+
+  DotConversion dot;
+  Type srcElementTy = aTensorTy.getElementType();
+  if (srcElementTy.isF16() || srcElementTy.isBF16()) {
+    dot.kind = "f16";
+  } else if (srcElementTy.isF32()) {
+    dot.kind = "tf32";
+  } else if (llvm::isa<Float8E4M3FNType, Float8E5M2Type>(srcElementTy)) {
+    dot.kind = "f8f6f4";
+  } else if (dTensorTy.getElementType().isInteger(32)) {
+    // PTX uses "i8" for integer operations (both signed and unsigned)
+    // The signed/unsigned distinction is encoded in the instruction descriptor
+    dot.kind = "i8";
+  } else {
+    llvm_unreachable("Unsupported type.");
+  }
+
+  dot.blockK = aTensorTy.getDimSize(1);
+  dot.mmaSizeK = 256 / aTensorTy.getElementTypeBitWidth();
+
+  auto tensorMemAttr =
+      cast<ttng::TensorMemoryEncodingAttr>(dTensorTy.getEncoding());
+  unsigned mmaSizeM = tensorMemAttr.getBlockM();
+
+  // 2xfp8 requires M = 128 for 1CTA or 256 for 2CTA, which corresponds to
+  // the condition mmaSizeM == 128 here
+  if (targetFeatures.supports2xFp8Tcgen05MMA() &&
+      aTensorTy.getElementTypeBitWidth() == 8 &&
+      aTensorTy.getDimSize(1) >= 64 && mmaSizeM == 128) {
+    dot.mmaSizeK = 64;
+  }
+
+  dot.numBitsPerElementA = aTensorTy.getElementTypeBitWidth();
+  dot.numBitsPerElementB = bTensorTy.getElementTypeBitWidth();
+
+  dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int, int,
+                            int) -> MMAInstOperands {
+    return {createInstDescriptor(rewriter, op, desc.mmaSizeM, desc.mmaSizeN,
+                                 desc.transA, desc.transB, dot.mmaSizeK),
+            {},
+            {}};
+  };
+
+  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
+                        adaptor.getA(), adaptor.getB(), dTensorTy,
+                        adaptor.getD(), adaptor.getUseD(), adaptor.getPred(),
+                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
+                        twoCTAs, commitDescs, targetFeatures, dot);
+}
+
+int64_t getFormatBitSize(ScaleDotElemType type) {
+  switch (type) {
+  case ScaleDotElemType::E4M3:
+    return 8;
+  case ScaleDotElemType::E5M2:
+    return 8;
+  case ScaleDotElemType::E2M3:
+    return 6;
+  case ScaleDotElemType::E3M2:
+    return 6;
+  case ScaleDotElemType::E2M1:
+    return 4;
+  default:
+    llvm_unreachable("Unsupported type.");
+  }
+}
+
+int getScaleFactorColsPerSet(mxfpKind kind, ttng::TCGen5MMAScaledOp op,
+                             int kSize) {
+  switch (kind) {
+  case mxfpKind::mxf8f6f4:
+    return kSize == 32 ? 1 : 2;
+  case mxfpKind::mxf4:
+    return kSize == 64 ? 2 : 4;
+  case mxfpKind::mxf4nvf4:
+    return getScaleVecSize(op) == 32 && kSize == 64 ? 2 : 4;
+  default:
+    llvm_unreachable("Unsupported mxfp kind.");
+  }
+};
+
+int linearizeScaleBlockIdx(Value scale, int mnIdx, int wordIdx, int numRepMn,
+                           int numRepKWords) {
+  auto enc = cast<ttng::TensorMemoryScalesEncodingAttr>(
+      cast<MemDescType>(scale.getType()).getEncoding());
+  return enc.getBlockRepOrder() ==
+                 ttng::TensorMemoryScalesBlockRepOrder::K_THEN_MN
+             ? (wordIdx + mnIdx * numRepKWords)
+             : (mnIdx + wordIdx * numRepMn);
+}
+
+LogicalResult convertScaledDot(const LLVMTypeConverter &typeConverter,
+                               ConversionPatternRewriter &rewriter,
+                               Location loc, ttng::TCGen5MMAScaledOp op,
+                               ttng::TCGen5MMAScaledOpAdaptor &adaptor,
+                               const ttng::TargetFeatures &targetFeatures) {
+  MemDescType aTensorTy = op.getA().getType();
+  MemDescType bTensorTy = op.getB().getType();
+  MemDescType dTensorTy = op.getD().getType();
+  int blockK = op.getBlockK();
+
+  mxfpKind mxfpInstKind =
+      getMXFPKind(op.getAType(), op.getBType(), op.getAScale().getType(),
+                  op.getBScale().getType(), blockK,
+                  isTransposed(op.getA()) || !isTransposed(op.getB()));
+  bool opKindIsMXFP4 = mxfpInstKind != mxfpKind::mxf8f6f4;
+
+  DotConversion dot;
+  switch (mxfpInstKind) {
+  case mxfpKind::mxf8f6f4:
+    dot.kind = "mxf8f6f4.block_scale.block32";
+    break;
+  case mxfpKind::mxf4:
+    dot.kind = "mxf4.block_scale.block32";
+    break;
+  case mxfpKind::mxf4nvf4:
+    dot.kind = getScaleVecSize(op) == 32 ? "mxf4nvf4.block_scale.block32"
+                                         : "mxf4nvf4.block_scale.block16";
+    break;
+  }
+
+  bool twoCTAs = ttng::getModuleTwoCTAs(op);
+  unsigned mmaSizeN = ttng::getMMAv5InstructionN(dTensorTy);
+
+  dot.blockK = blockK; // K is not split across CTAs
+
+  bool hasFp4PaddedOperand = isFp4Padded(aTensorTy) || isFp4Padded(bTensorTy);
+
+  if (!targetFeatures.supports4xFp4Tcgen05MMA() || hasFp4PaddedOperand ||
+      // We need to disable MMA_K = 128 for NVFP4 on Rubin when MMA_N < 128,
+      // which requires a special unpacked layout for scales B in TMEM
+      // (currently undocumented). tensorMemoryScalesToLinearLayout and lowering
+      // of tcgen05.cp need to be updated for this.
+      (mxfpInstKind == mxfpKind::mxf4nvf4 && mmaSizeN < 128)) {
+    dot.mmaSizeK = opKindIsMXFP4 ? 64 : 32;
+  } else {
+    dot.mmaSizeK = opKindIsMXFP4 ? std::min(blockK, 128) : std::min(blockK, 64);
+  }
+
+  dot.numBitsPerElementA = getFormatBitSize(op.getAType());
+  dot.numBitsPerElementB = getFormatBitSize(op.getBType());
+
+  TritonLLVMOpBuilder tb(loc, rewriter);
+  Value baseScaleA = tb.ptrtoint(i32_ty, adaptor.getAScale());
+  Value baseScaleB = tb.ptrtoint(i32_ty, adaptor.getBScale());
+  SmallVector<Value> commitDescs = op.getCompletionDescs();
+  bool useK96 =
+      targetFeatures.supportsK96Tcgen05MMA() && twoCTAs && opKindIsMXFP4 &&
+      !hasFp4PaddedOperand && blockK % 256 == 0 &&
+      isa<SharedMemorySpaceAttr>(aTensorTy.getMemorySpace()) &&
+      ttng::getNvmmaSmemAttrs(aTensorTy)->swizzlingByteWidth == 128 &&
+      ttng::getNvmmaSmemAttrs(bTensorTy)->swizzlingByteWidth == 128 &&
+      // K96 reads consecutive scale words with a fixed hardware stride.
+      // Repeated MN tiles or subviews must not interleave unrelated words.
+      ttng::getTMemSubSliceOffset(op.getAScale().getType(), 4, 1) == 4 &&
+      ttng::getTMemSubSliceOffset(op.getBScale().getType(), 4, 1) ==
+          std::max(2u, mmaSizeN / 32);
+  if (useK96) {
+    // K96 tiles must come in pairs to leave a K64-aligned remainder.
+    int numK96 = 2 * (blockK / 192);
+    int numK64 = (blockK % 192) / 64;
+    // On a tie, keep 96+96+64 within each packed 128-byte sector to avoid
+    // absolute continuation descriptors. Otherwise minimize the MMA count.
+    bool crossSectors = numK96 + numK64 < 3 * (blockK / 256);
+    for (int offset = 0; offset < blockK;) {
+      int size = crossSectors ? (offset < numK96 * 96 ? 96 : 64)
+                              : (offset % 256 < 192 ? 96 : 64);
+      dot.kOffsets.push_back(offset);
+      offset += size;
+    }
+    dot.kOffsets.push_back(blockK);
+  }
+  int mmasPerScaleWord =
+      4 / getScaleFactorColsPerSet(mxfpInstKind, op, dot.mmaSizeK);
+
+  dot.getInstOperands = [&](const DotConversion::InstDesc &desc, int m, int n,
+                            int k) -> MMAInstOperands {
+    auto [numRepM, numRepN, numRepK] = desc.repShape;
+    int numRepKWords = ceil<int>(blockK, dot.mmaSizeK * mmasPerScaleWord);
+    int numColPerScaleBlockA = ceil<int>(
+        ttng::getTmemAllocSizes(cast<MemDescType>(op.getAScale().getType()))
+            .numCols,
+        numRepM * numRepKWords);
+    int numColPerScaleBlockB = ceil<int>(
+        ttng::getTmemAllocSizes(cast<MemDescType>(op.getBScale().getType()))
+            .numCols,
+        numRepN * numRepKWords);
+    numColPerScaleBlockB = std::max(numColPerScaleBlockB, 2);
+    int baseK = dot.getKOffset(k) / dot.mmaSizeK;
+    int subWordIdx = baseK % mmasPerScaleWord;
+    int wordIdx = baseK / mmasPerScaleWord;
+    int scaleIdxA = linearizeScaleBlockIdx(op.getAScale(), m, wordIdx, numRepM,
+                                           numRepKWords);
+    int scaleIdxB = linearizeScaleBlockIdx(op.getBScale(), n, wordIdx, numRepN,
+                                           numRepKWords);
+    int offsetA = scaleIdxA * numColPerScaleBlockA;
+    int offsetB = scaleIdxB * numColPerScaleBlockB;
+    if (useK96) {
+      offsetA =
+          ttng::getTMemSubSliceOffset(op.getAScale().getType(),
+                                      m * desc.mmaSizeM, 0) +
+          ttng::getTMemSubSliceOffset(op.getAScale().getType(), wordIdx * 4, 1);
+      offsetB =
+          ttng::getTMemSubSliceOffset(op.getBScale().getType(),
+                                      n * desc.mmaSizeN, 0) +
+          ttng::getTMemSubSliceOffset(op.getBScale().getType(), wordIdx * 4, 1);
+    }
+    Value scaleA = tb.add(baseScaleA, tb.i32_val(offsetA));
+    Value scaleB = tb.add(baseScaleB, tb.i32_val(offsetB));
+    Value instDescriptor;
+    if (mxfpInstKind == mxfpKind::mxf8f6f4) {
+      instDescriptor = createScaleInstDescriptorFp8(
+          rewriter, op, desc.mmaSizeM, desc.mmaSizeN, desc.transA, desc.transB,
+          subWordIdx, subWordIdx, dot.mmaSizeK);
+    } else {
+      // K96 selectors address individual scale bytes rather than K64 sets.
+      int scaleId = dot.getKSize(k) == 96
+                        ? (dot.getKOffset(k) / getScaleVecSize(op)) % 4
+                        : subWordIdx;
+      instDescriptor = createScaleInstDescriptorFp4(
+          rewriter, op, desc.mmaSizeM, desc.mmaSizeN, desc.transA, desc.transB,
+          scaleId, scaleId, mxfpInstKind, blockK, dot.getKSize(k));
+    }
+
+    return {instDescriptor, scaleA, scaleB};
+  };
+
+  return convertDotImpl(typeConverter, rewriter, loc, op.getA(), op.getB(),
+                        adaptor.getA(), adaptor.getB(), dTensorTy,
+                        adaptor.getD(), adaptor.getUseD(), adaptor.getPred(),
+                        adaptor.getBarriers(), adaptor.getBarrierPreds(),
+                        twoCTAs, commitDescs, targetFeatures, dot);
+}
+
+//===----------------------------------------------------------------------===//
+// Conversion Patterns
+//===----------------------------------------------------------------------===//
+
+struct TCGen5MMAOpConversion
+    : public ConvertOpToLLVMPattern<ttng::TCGen5MMAOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  TCGen5MMAOpConversion(LLVMTypeConverter &converter, PatternBenefit benefit,
+                        const ttng::TargetFeatures &targetFeatures)
+      : ConvertOpToLLVMPattern<ttng::TCGen5MMAOp>(converter, benefit),
+        targetFeatures(targetFeatures) {}
+
+  LogicalResult
+  matchAndRewrite(ttng::TCGen5MMAOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(convertDot(*getTypeConverter(), rewriter, op.getLoc(), op,
+                          adaptor, targetFeatures)))
+      return failure();
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  ttng::TargetFeatures targetFeatures;
+};
+
+struct TCGen5MMAScaledOpConversion
+    : public ConvertOpToLLVMPattern<ttng::TCGen5MMAScaledOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  TCGen5MMAScaledOpConversion(LLVMTypeConverter &converter,
+                              PatternBenefit benefit,
+                              const ttng::TargetFeatures &targetFeatures)
+      : ConvertOpToLLVMPattern<ttng::TCGen5MMAScaledOp>(converter, benefit),
+        targetFeatures(targetFeatures) {}
+
+  LogicalResult
+  matchAndRewrite(ttng::TCGen5MMAScaledOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (failed(convertScaledDot(*getTypeConverter(), rewriter, op.getLoc(), op,
+                                adaptor, targetFeatures)))
+      return failure();
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+private:
+  ttng::TargetFeatures targetFeatures;
+};
+
+struct TCGen5CommitOpConversion
+    : public ConvertOpToLLVMPattern<ttng::TCGen5CommitOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(ttng::TCGen5CommitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    TritonLLVMOpBuilder b(loc, rewriter);
+
+    auto smemObj = LLVM::getSharedMemoryObjectFromStruct(
+        loc, adaptor.getBarrier(), rewriter.getI64Type(), rewriter);
+    Value pred = LLVM::NVIDIA::createElectPredicateWarp0(loc, rewriter);
+
+    if (adaptor.getPred())
+      pred = b.and_(adaptor.getPred(), pred);
+
+    bool twoCTAs = ttng::getModuleTwoCTAs(op);
+    if (twoCTAs) {
+      Value cluster0 = LLVM::NVIDIA::createLeadCTAPredicate(loc, rewriter);
+      pred = b.and_(pred, cluster0);
+    }
+
+    createMMACommit(rewriter, op.getLoc(), smemObj.getBase(), pred, twoCTAs,
+                    op.getDescs());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+} // namespace
+
+namespace mlir {
+namespace triton {
+namespace NVIDIA {
+
+void populateTCGen5MMAOpToLLVMPattern(LLVMTypeConverter &typeConverter,
+                                      RewritePatternSet &patterns,
+                                      PatternBenefit benefit,
+                                      const TargetInfo &targetInfo) {
+  patterns.add<TCGen5MMAOpConversion, TCGen5MMAScaledOpConversion>(
+      typeConverter, benefit, targetInfo.getTargetFeatures());
+  patterns.add<TCGen5CommitOpConversion>(typeConverter, benefit);
+}
+
+} // namespace NVIDIA
+} // namespace triton
+} // namespace mlir

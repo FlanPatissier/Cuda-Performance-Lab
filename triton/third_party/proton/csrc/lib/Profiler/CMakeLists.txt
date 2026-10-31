@@ -1,0 +1,13 @@
+add_proton_library(ProtonProfiler
+  Profiler.cpp
+  GPUProfiler.cpp
+  Graph.cpp
+  Cupti/CuptiPCSampling.cpp
+  Cupti/CuptiProfiler.cpp
+  RocprofSDK/RocprofSDKPCSampling.cpp
+  RocprofSDK/RocprofSDKPCSamplingSourceLocations.cpp
+  RocTracer/RoctracerProfiler.cpp
+  RocprofSDK/RocprofSDKProfiler.cpp
+  Instrumentation/InstrumentationProfiler.cpp
+  Instrumentation/Metadata.cpp
+)
