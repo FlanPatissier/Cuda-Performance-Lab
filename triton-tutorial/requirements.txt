@@ -1,0 +1,6 @@
+jupyter
+jupyterlab
+matplotlib
+numpy
+pandas
+torch==2.7.1
