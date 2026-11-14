@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Matrix Multiplication Visualizer - 2D Tile + 向量化</title>
+<style>
+:root{--bg:#0b1020;--panel:#141c30;--panel2:#1b2740;--line:#2c3a56;--text:#e9efff;--muted:#a8b5d1;--blue:#63a8ff;--orange:#ffbf69;--green:#59d6a2;--red:#ff8585;--purple:#b48cff;--cyan:#5fd4d0}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{padding:24px max(20px,calc((100vw - 1240px)/2));background:linear-gradient(120deg,#142443,#101729);border-bottom:1px solid var(--line)}
+h1{margin:0 0 6px;font-size:26px}h2{font-size:19px;margin:0 0 12px}h3{font-size:16px;margin:0 0 8px}.sub{color:var(--muted)}
+main{max-width:1240px;margin:22px auto;padding:0 18px 50px;display:grid;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+label{display:grid;gap:4px;color:var(--muted);font-size:13px}
+input,select,button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit}
+input{width:90px}button{cursor:pointer}button:hover{border-color:var(--blue)}button.primary{background:#1b4778;border-color:#367dc3}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.kpi{background:var(--panel2);padding:10px;border-radius:10px}.kpi b{display:block;font-size:19px}
+.small{font-size:13px;color:var(--muted)}.formula{font-family:ui-monospace,Consolas,monospace;background:#0d1526;border:1px solid var(--line);padding:10px;border-radius:9px;overflow-wrap:anywhere}
+.matrix{display:grid;gap:3px}.cell{background:#202d45;border-radius:4px;text-align:center;padding:5px 1px;font:11px ui-monospace,monospace;color:#cbd8f3;min-width:0}.cell.sel{outline:2px solid var(--green);background:#245a50}.cell.valid{background:#23466b}.cell.invalid{background:#54343a;color:#ffd0d0}.cell.loader{outline:2px dashed var(--orange);outline-offset:-2px}.cell.vec{background:#2a4a2a;color:#a8ffb0}.cell.vec-b{background:#4a3a2a;color:#ffd9a8}.cell.tmp{background:#2a2a4a;color:#b0a8ff}.cell.tmp-sel{outline:2px solid var(--purple);background:#3a2a5a}
+.steps{display:flex;gap:5px;flex-wrap:wrap}.steps button{font-size:12px;padding:6px 9px}.steps button.active{border-color:var(--green);background:#19483f}
+.good{color:var(--green)}.warn{color:var(--orange)}.bad{color:var(--red)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0d1526;border:1px solid var(--line);border-radius:9px;padding:12px;margin:8px 0;font:12px/1.55 ui-monospace,Consolas,monospace}
+.pointer-advance{background:#0d1526;border:1px solid var(--line);padding:12px;border-radius:9px;font-family:ui-monospace,Consolas,monospace}
+.pointer-advance .step{display:flex;gap:10px;margin-bottom:8px;align-items:flex-start}
+.pointer-advance .step-num{background:#244d7c;color:white;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;margin-top:1px}
+.tile-diagram{background:#0d1526;border:1px solid var(--line);border-radius:9px;padding:12px;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre;overflow-x:auto;color:#cbd8f3}
+.explain-box{background:#10192b;border-left:3px solid var(--blue);padding:10px 14px;border-radius:0 8px 8px 0;margin:10px 0}
+.explain-box.warn{border-left-color:var(--orange)}
+.explain-box.good{border-left-color:var(--green)}
+.explain-box.purple{border-left-color:var(--purple)}
+.loader-table{width:100%;border-collapse:collapse;font:12px ui-monospace,Consolas,monospace;margin-top:6px}
+.loader-table td,.loader-table th{border:1px solid var(--line);padding:4px 8px;text-align:center}
+.loader-table th{background:#10192b;color:var(--muted)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}
+.legend span{display:flex;align-items:center;gap:4px}
+.legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+.tile-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.tile-header .tag{font-size:11px;padding:2px 6px;border-radius:4px;background:#263752;color:#cfe2ff}
+.vec-row{display:flex;gap:2px;margin-top:4px}
+.vec-row .vec-cell{background:#1b2740;border:1px solid var(--line);border-radius:3px;padding:2px 6px;font:11px ui-monospace,monospace;color:#cbd8f3}
+.vec-row .vec-cell.f4{background:#244d7c;color:#fff;border-color:var(--blue)}
+@media(max-width:850px){.grid2,.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>CUDA Matrix Multiplication Visualizer</h1><div class="sub">Shared Memory + 2D Thread Tile + 向量化 · float4 访存与转置问题详解 · 中文交互教学版</div></header>
+<main>
+<section class="panel">
+<h2>1. 配置实验</h2>
+<div class="controls">
+<label>M<input id="M" type="number" min="1" max="256" value="64"></label>
+<label>N<input id="N" type="number" min="1" max="256" value="64"></label>
+<label>K<input id="K" type="number" min="1" max="256" value="64"></label>
+<label>BM<input id="BM" type="number" min="4" max="32" value="16"></label>
+<label>BN<input id="BN" type="number" min="4" max="32" value="16"></label>
+<label>BK<input id="BK" type="number" min="4" max="16" value="8"></label>
+<label>TM<input id="TM" type="number" min="4" max="8" value="4"></label>
+<label>TN<input id="TN" type="number" min="4" max="8" value="4"></label>
+<button class="primary" id="apply">应用配置</button>
+</div>
+<p class="small">为便于可视化，默认 BM=BN=16、BK=8、TM=TN=4。要求 BM/BN/BK/TM/TN 均为 4 的倍数以支持 float4。NUM_THREADS=(BM*BN)/(TM*TN)=16。</p>
+<div class="kpis" id="kpis"></div>
+</section>
+
+<section class="panel">
+<h2>2. 执行阶段</h2>
+<div class="steps" id="steps"></div>
+<div class="controls" style="margin-top:12px">
+<button id="prev">← 上一步</button><button class="primary" id="next">下一步 →</button><button id="reset">重置</button>
+<span class="small" id="stageCounter"></span>
+</div>
+<div id="stageDesc" style="margin-top:12px"></div>
+</section>
+
+<section class="panel">
+<h2>3. Grid / Block / Thread 导航</h2>
+<div class="grid2">
+<div>
+<h3>Grid 中的 Block</h3><div id="blockGrid" class="matrix"></div>
+<p class="small">横向 blockIdx.x（BN 方向），纵向 blockIdx.y（BM 方向）。</p>
+</div>
+<div>
+<h3>当前 Block 的 Thread（NUM_THREADS 个）</h3><div id="threadGrid" class="matrix"></div>
+<p class="small">点击 Thread 查看其 TM×TN 输出块。</p>
+</div>
+</div>
+</section>
+
+<section class="panel">
+<h2>4. 当前 Thread 的精确计算过程</h2>
+<div class="kpis" id="threadKpis"></div>
+<div class="grid2" style="margin-top:12px">
+<div><h3>坐标映射与负责的 TM×TN 输出块</h3><div id="mapping"></div></div>
+<div><h3>当前阶段的操作</h3><div id="operation"></div></div>
+</div>
+<div style="margin-top:12px"><h3>向量化加载详解（float4）</h3><div id="loads"></div></div>
+<div style="margin-top:12px"><h3>外积累加：TM×TN</h3><div id="accum"></div></div>
+<div style="margin-top:12px"><h3>指针推进与 K Tile</h3><div id="pointerAdvance" class="pointer-advance"></div></div>
+<div style="margin-top:12px"><h3>向量化写回 C</h3><div id="writeback"></div></div>
+</section>
+
+<section class="panel">
+<h2>5. 全链路数据流可视化</h2>
+<div class="legend">
+  <span><span class="dot" style="background:#23466b"></span>有效数据</span>
+  <span><span class="dot" style="background:#54343a"></span>越界补0</span>
+  <span><span class="dot" style="background:#245a50;outline:2px solid var(--green)"></span>选中/负责</span>
+  <span><span class="dot" style="background:transparent;border:2px dashed var(--orange)"></span>本线程加载</span>
+  <span><span class="dot" style="background:#2a4a2a"></span>aReg（float4）</span>
+  <span><span class="dot" style="background:#4a3a2a"></span>bReg（float4）</span>
+  <span><span class="dot" style="background:#2a2a4a"></span>tmp</span>
+</div>
+
+<div class="grid2" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header">
+      <h3>A Tile（smem_a，转置存放）</h3><span class="tag" id="atileTag"></span>
+    </div>
+    <div id="atile" class="matrix"></div>
+    <p class="small">smem_a 布局是 [BK][BM]，即 A 的转置。橙色虚线框=本线程通过 float4 加载的 4 个连续元素。转置写时拆成 4 次标量写。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header">
+      <h3>B Tile（smem_b，不转置）</h3><span class="tag" id="btileTag"></span>
+    </div>
+    <div id="btile" class="matrix"></div>
+    <p class="small">smem_b 布局是 [BK][BN]，与 B 一致。橙色虚线框=本线程通过 float4 加载的 4 个连续元素。可以直接 float4 写 smem_b。</p>
+  </div>
+</div>
+
+<div class="grid3" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>aReg[TM]</h3><span class="tag">按列取，float4</span></div>
+    <div id="areg" class="matrix"></div>
+    <p class="small">从 smem_a 用 LDG_FLOAT4 读 TM 个连续元素（因转置，它们在 smem_a 中连续）。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>bReg[TN]</h3><span class="tag">按行取，float4</span></div>
+    <div id="breg" class="matrix"></div>
+    <p class="small">从 smem_b 用 LDG_FLOAT4 读 TN 个连续元素（不转置，它们在 smem_b 中连续）。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>tmp[TM][TN]</h3><span class="tag">TM×TN</span></div>
+    <div id="tmpgrid" class="matrix"></div>
+    <p class="small">外积结果累加。</p>
+  </div>
+</div>
+
+<div class="grid2" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>C Tile（输出）</h3><span class="tag">BM×BN</span></div>
+    <div id="ctile" class="matrix"></div>
+    <p class="small">绿色=本线程负责的 TM×TN 输出块，向量化写回。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>写回映射：tmp → C</h3><span class="tag">TM×TN，float4</span></div>
+    <div id="writebackMap" class="matrix"></div>
+    <p class="small">每 TN 个连续元素用一次 STG_FLOAT4 写回。</p>
+  </div>
+</div>
+</section>
+
+<section class="panel">
+<h2>6. 向量化详解：LDG/STG 宏与转置问题</h2>
+<div id="vecExplanation"></div>
+</section>
+
+<section class="panel">
+<h2>7. 关键代码对照</h2><div id="code"></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let cfg={M:64,N:64,K:64,BM:16,BN:16,BK:8,TM:4,TN:4};
+let stage=0, kTile=0, block={x:0,y:0}, thread={x:0};
+let curDotIdx=0;
+
+const stages=[
+  "Block / Thread 坐标映射",
+  "向量化加载 A（转置问题）",
+  "向量化加载 B（无转置）",
+  "第一次 __syncthreads()",
+  "外积累加（float4 读取）",
+  "第二次 __syncthreads()",
+  "推进 K 到下一个 Tile",
+  "向量化写回 C"
+];
+
+const VEC=4;
+function NUM_THREADS(){return (cfg.BM*cfg.BN)/(cfg.TM*cfg.TN)}
+function THREAD_COLS(){return cfg.BN/cfg.TN}
+function LDG_A_NUM(){return (cfg.BM*cfg.BK)/NUM_THREADS()/VEC}
+function LDG_B_NUM(){return (cfg.BK*cfg.BN)/NUM_THREADS()/VEC}
+function STRIDE_A(){return cfg.BM/LDG_A_NUM()}
+function STRIDE_B(){return cfg.BK/LDG_B_NUM()}
+function gridX(){return Math.ceil(cfg.N/cfg.BN)}
+function gridY(){return Math.ceil(cfg.M/cfg.BM)}
+function threadRow(){return Math.floor(thread.x/THREAD_COLS())*cfg.TM}
+function threadCol(){return (thread.x%THREAD_COLS())*cfg.TN}
+function gRow(){return block.y*cfg.BM+threadRow()}
+function gCol(){return block.x*cfg.BN+threadCol()}
+function maxStage(){return stages.length-1}
+function stageName(){return stages[stage]}
+
+function render(){
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  $("kpis").innerHTML=[
+    ["Grid",`${gridX()} × ${gridY()}`],
+    ["NUM_THREADS",NT],
+    ["THREAD_COLS",TC],
+    ["LDG_A_NUM",LDG_A_NUM()],
+    ["LDG_B_NUM",LDG_B_NUM()],
+    ["STRIDE_A",SA],
+    ["STRIDE_B",SB],
+    ["K Tile 轮数",Math.ceil(cfg.K/cfg.BK)]
+  ].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+
+  $("steps").innerHTML=stages.map((n,i)=>`<button data-stage="${i}" class="${i===stage?"active":""}">${i+1}. ${n}</button>`).join("");
+  $("stageCounter").textContent=`阶段 ${stage+1}/${stages.length}：${stageName()}`;
+  $("stageDesc").innerHTML=description();
+
+  const maxGridShow=8;
+  $("blockGrid").style.gridTemplateColumns=`repeat(${Math.min(gridX(),maxGridShow)},minmax(0,1fr))`;
+  $("blockGrid").innerHTML=Array.from({length:gridX()*gridY()},(_,i)=>{
+    let x=i%gridX(),y=Math.floor(i/gridX());
+    let sel=x===block.x&&y===block.y;
+    return `<button class="cell ${sel?"sel":""}" data-block="${x},${y}">B(${x},${y})</button>`
+  }).join("");
+
+  const showThreads=Math.min(NT,64);
+  $("threadGrid").style.gridTemplateColumns=`repeat(${Math.min(TC,8)},minmax(0,1fr))`;
+  $("threadGrid").innerHTML=Array.from({length:showThreads},(_,i)=>{
+    let sel=i===thread.x;
+    let r=Math.floor(i/TC), c=i%TC;
+    return `<button class="cell ${sel?"sel":""}" data-thread="${i}">#${i}<br>r${r}c${c}</button>`
+  }).join("");
+
+  renderDetails();renderTiles();renderVecExplanation();renderCode();
+}
+
+function description(){
+  const b=block, BK=kTile*cfg.BK;
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+  const texts=[
+    `Block (${b.x},${b.y})。<br>
+     threadIdx.x=${thread.x} → thread_col=(tid%${TC})×TN=${tC}，thread_row=(tid/${TC})×TM=${tR}。<br>
+     负责 C 的 TM×TN=${cfg.TM}×${cfg.TN} 输出块，左上角 (gRow=${gRow()}, gCol=${gCol()})。`,
+    `bkIdx=${BK}。<br>
+     <b>A 加载</b>：inner_row_a=tid/(BK/VEC)=${Math.floor(thread.x/(cfg.BK/VEC))}，inner_col_a=(tid%(BK/VEC))×VEC=${(thread.x%(cfg.BK/VEC))*VEC}。<br>
+     用 LDG_FLOAT4 读 A 的 4 个连续元素（同一行），但写入 smem_a 时因转置（[BK][BM]）需拆成 4 次标量写。<br>
+     循环 i=0, STRIDE_A(${SA}), ... < BM，每轮加载 4 个 float4。`,
+    `bkIdx=${BK}。<br>
+     <b>B 加载</b>：inner_row_b=tid/(BN/VEC)=${Math.floor(thread.x/(cfg.BN/VEC))}，inner_col_b=(tid%(BN/VEC))×VEC=${(thread.x%(cfg.BN/VEC))*VEC}。<br>
+     用 LDG_FLOAT4 读 B 的 4 个连续元素，smem_b 不转置（[BK][BN]），可以直接 STG_FLOAT4 写入。<br>
+     循环 i=0, STRIDE_B(${SB}), ... < BK。`,
+    `__syncthreads() 同步，As、Bs 全部写好。`,
+    `外积：对 dotIdx=0..BK-1，从 smem_a 用 float4 读 TM 个连续元素（因转置），从 smem_b 用 float4 读 TN 个连续元素。然后标量乘加。`,
+    `第二次 __syncthreads()，防止覆盖。`,
+    `A += BK=${cfg.BK}；B += BK×N=${cfg.BK*cfg.N}。下一轮 bkIdx=${Math.min(BK+cfg.BK,cfg.K)}。`,
+    `写回 C：TM×TN 个结果，每 TN 个连续元素用一次 STG_FLOAT4。`
+  ];
+  return `<p>${texts[stage]}</p>`;
+}
+
+function renderDetails(){
+  const b=block, BK=kTile*cfg.BK;
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+
+  $("threadKpis").innerHTML=[
+    ["blockIdx",`(${b.x}, ${b.y})`],
+    ["threadIdx.x",thread.x],
+    ["thread_row / col",`${tR} / ${tC}`],
+    ["TM×TN",`${cfg.TM}×${cfg.TN}`],
+    ["gRow / gCol",`${gRow()} / ${gCol()}`],
+    ["STRIDE_A",SA],
+    ["STRIDE_B",SB],
+    ["dotIdx",curDotIdx]
+  ].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+
+  $("mapping").innerHTML=`<div class="formula">
+c_row = blockIdx.y = ${b.y}，c_col = blockIdx.x = ${b.x}<br>
+THREAD_COLS = BN/TN = ${cfg.BN}/${cfg.TN} = ${TC}<br>
+thread_col = (threadIdx.x % THREAD_COLS) × TN = ${thread.x} % ${TC} × ${cfg.TN} = ${tC}<br>
+thread_row = (threadIdx.x / THREAD_COLS) × TM = floor(${thread.x}/${TC}) × ${cfg.TM} = ${tR}<br>
+gRow = c_row × BM + thread_row = ${gRow()}<br>
+gCol = c_col × BN + thread_col = ${gCol()}<br>
+负责输出块：C[${gRow()}..${gRow()+cfg.TM-1}][${gCol()}..${gCol()+cfg.TN-1}]
+</div>`;
+
+  $("operation").innerHTML=`<div class="formula">
+输出块：C 的 ${cfg.TM} 行 × ${cfg.TN} 列<br>
+Block 覆盖行：[${b.y*cfg.BM}, ${Math.min((b.y+1)*cfg.BM,cfg.M)-1}]<br>
+Block 覆盖列：[${b.x*cfg.BN}, ${Math.min((b.x+1)*cfg.BN,cfg.N)-1}]<br>
+K Tile 起点 bkIdx=${BK}，BK=${cfg.BK}<br>
+VEC=4，LDG_A_NUM=${LDG_A_NUM()}，LDG_B_NUM=${LDG_B_NUM()}
+</div>`;
+
+  // 向量化加载详解
+  const inner_row_a=Math.floor(thread.x/(cfg.BK/VEC)), inner_col_a=(thread.x%(cfg.BK/VEC))*VEC;
+  const inner_row_b=Math.floor(thread.x/(cfg.BN/VEC)), inner_col_b=(thread.x%(cfg.BN/VEC))*VEC;
+
+  let aRows=[], bRows=[];
+  for(let i=0;i<cfg.BM;i+=SA){
+    const aRow=i+inner_row_a, aCol=inner_col_a;
+    const valid=(b.y*cfg.BM+aRow<cfg.M)&&(BK+aCol+3<cfg.K);
+    aRows.push({aRow,aCol,valid,off:i});
+  }
+  for(let i=0;i<cfg.BK;i+=SB){
+    const bRow=inner_row_b+i, bCol=inner_col_b;
+    const valid=(BK+bRow<cfg.K)&&(b.x*cfg.BN+bCol+3<cfg.N);
+    bRows.push({bRow,bCol,valid,off:i});
+  }
+
+  let aTable=`<table class="loader-table"><tr><th>offset</th><th>aRow</th><th>aCol</th><th>读取 A（float4）</th><th>写入 smem_a（4 次标量）</th><th>有效?</th></tr>`;
+  aRows.forEach(r=>{
+    aTable+=`<tr>
+      <td>${r.off}</td><td>${r.aRow}</td><td>${r.aCol}</td>
+      <td>A[${b.y*cfg.BM+r.aRow}][${BK+r.aCol}..${BK+r.aCol+3}]</td>
+      <td>smem_a[${r.aCol}][${r.aRow}]<br>smem_a[${r.aCol+1}][${r.aRow}]<br>smem_a[${r.aCol+2}][${r.aRow}]<br>smem_a[${r.aCol+3}][${r.aRow}]</td>
+      <td class="${r.valid?'good':'bad'}">${r.valid?'✓':'补0'}</td>
+    </tr>`;
+  });
+  aTable+=`</table>`;
+
+  let bTable=`<table class="loader-table"><tr><th>offset</th><th>bRow</th><th>bCol</th><th>读取 B（float4）</th><th>写入 smem_b（1 次 float4）</th><th>有效?</th></tr>`;
+  bRows.forEach(r=>{
+    bTable+=`<tr>
+      <td>${r.off}</td><td>${r.bRow}</td><td>${r.bCol}</td>
+      <td>B[${BK+r.bRow}][${b.x*cfg.BN+r.bCol}..${b.x*cfg.BN+r.bCol+3}]</td>
+      <td>smem_b[${r.bRow}][${r.bCol}..${r.bCol+3}] ← float4</td>
+      <td class="${r.valid?'good':'bad'}">${r.valid?'✓':'补0'}</td>
+    </tr>`;
+  });
+  bTable+=`</table>`;
+
+  $("loads").innerHTML=`
+  <div class="formula">
+  <b>A 加载</b>：LDG_A_NUM = BM·BK/(NUM_THREADS·VEC) = ${LDG_A_NUM()}，STRIDE_A = BM/LDG_A_NUM = ${SA}。<br>
+  inner_row_a = ${inner_row_a}，inner_col_a = ${inner_col_a}（4 对齐）。<br>
+  <b>B 加载</b>：LDG_B_NUM = BK·BN/(NUM_THREADS·VEC) = ${LDG_B_NUM()}，STRIDE_B = BK/LDG_B_NUM = ${SB}。<br>
+  inner_row_b = ${inner_row_b}，inner_col_b = ${inner_col_b}（4 对齐）。
+  </div>
+  <h3 style="margin-top:12px">A 向量化加载（读 float4，转置写 4 次标量）</h3>${aTable}
+  <h3 style="margin-top:12px">B 向量化加载（读 float4，直接 float4 写）</h3>${bTable}
+  <p class="small">关键区别：A 的 smem 是转置的（[BK][BM]），4 个连续元素在 smem 中不连续，只能标量写；B 的 smem 不转置，4 个连续元素在 smem 中仍连续，可以 float4 写。</p>`;
+
+  // 外积累加
+  $("accum").innerHTML=`<div class="formula">
+tmp[${cfg.TM}][${cfg.TN}]，当前 dotIdx=${curDotIdx}<br>
+<b>aReg 按列取</b>：smem_a[dotIdx][thread_row .. thread_row+TM-1]，因转置它们在 smem_a 中连续，可用 float4 读。<br>
+&nbsp;&nbsp;→ 行号 ${tR}..${tR+cfg.TM-1}（thread_row），列固定 ${curDotIdx}（dotIdx）。<br>
+<b>bReg 按行取</b>：smem_b[dotIdx][thread_col .. thread_col+TN-1]，不转置，连续，可用 float4 读。<br>
+&nbsp;&nbsp;→ 行固定 ${curDotIdx}，列号 ${tC}..${tC+cfg.TN-1}。<br>
+tmp[i][j] += aReg[i] × bReg[j]<br><br>
+虽然读是 float4，但乘加仍按标量执行。float4 只减少访存指令数，不改变计算。
+</div>`;
+
+  const nextBk=Math.min(BK+cfg.BK,cfg.K);
+  $("pointerAdvance").innerHTML=`
+    <div class="step"><span class="step-num">1</span><span>当前 K Tile：<b>bkIdx = ${BK}</b>，BK = ${cfg.BK}</span></div>
+    <div class="step"><span class="step-num">2</span><span>A 加载：LDG_FLOAT4 读 A[(inner_row_a+i)·K + inner_col_a]，转置写 smem_a。</span></div>
+    <div class="step"><span class="step-num">3</span><span>B 加载：LDG_FLOAT4 读 B[(inner_row_b+i)·N + inner_col_b]，STG_FLOAT4 写 smem_b。</span></div>
+    <div class="step"><span class="step-num">4</span><span>指针推进：A += BK=${cfg.BK}；B += BK×N=${cfg.BK*cfg.N}。下一轮 bkIdx=${nextBk}${nextBk>=cfg.K?' <span class="bad">(K 末尾)</span>':' <span class="good">(继续)</span>'}</span></div>`;
+
+  // 向量化写回
+  let wb=`<div class="formula">C 写回，每 TN 个连续元素用一次 STG_FLOAT4：<br>`;
+  for(let m=0;m<cfg.TM;m++){
+    for(let n=0;n<cfg.TN;n+=VEC){
+      const row=gRow()+m, col=gCol()+n;
+      const ok=row<cfg.M && col+3<cfg.N;
+      wb+=`C[${row}][${col}..${col+3}] ${ok?'<span class="good">← STG_FLOAT4(tmp['+m+']['+n+'..])</span>':'<span class="bad">边界处理/越界</span>'}<br>`;
+    }
+  }
+  wb+=`</div>`;
+  $("writeback").innerHTML=wb;
+}
+
+/* ========== 全链路 Tile 可视化 ========== */
+function renderTiles(){
+  const b=block, BK=kTile*cfg.BK;
+  const SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+  const inner_row_a=Math.floor(thread.x/(cfg.BK/VEC)), inner_col_a=(thread.x%(cfg.BK/VEC))*VEC;
+  const inner_row_b=Math.floor(thread.x/(cfg.BN/VEC)), inner_col_b=(thread.x%(cfg.BN/VEC))*VEC;
+
+  // A Tile: smem_a 布局 [BK][BM]，所以显示 BK 行 × BM 列
+  const aRowSamples=Math.min(cfg.BK,8), aColSamples=Math.min(cfg.BM,10);
+  const aLoadSet=new Set();
+  for(let i=0;i<cfg.BM;i+=SA){
+    for(let v=0;v<VEC;v++){
+      aLoadSet.add((inner_col_a+v)+","+(i+inner_row_a)); // smem_a[row=aCol+v][col=aRow]
+    }
+  }
+  function sampleHasA(sr,sc){
+    const r0=Math.floor(sr*cfg.BK/aRowSamples), r1=Math.floor((sr+1)*cfg.BK/aRowSamples);
+    const c0=Math.floor(sc*cfg.BM/aColSamples), c1=Math.floor((sc+1)*cfg.BM/aColSamples);
+    for(let r=r0;r<Math.max(r1,r0+1);r++)
+      for(let c=c0;c<Math.max(c1,c0+1);c++)
+        if(aLoadSet.has(r+","+c)) return true;
+    return false;
+  }
+  let aHtml="";
+  $("atile").style.gridTemplateColumns=`repeat(${aColSamples},minmax(0,1fr))`;
+  for(let r=0;r<aRowSamples;r++){
+    for(let c=0;c<aColSamples;c++){
+      const r0=Math.floor(r*cfg.BK/aRowSamples), c0=Math.floor(c*cfg.BM/aColSamples);
+      const valid=(BK+r0<cfg.K)&&(b.y*cfg.BM+c0<cfg.M);
+      const loader=sampleHasA(r,c);
+      aHtml+=`<div class="cell ${loader?'loader':''} ${valid?'valid':'invalid'}" title="smem_a[${r0}][${c0}] ← A[${b.y*cfg.BM+c0}][${BK+r0}]">${valid?'A':'0'}</div>`;
+    }
+  }
+  $("atile").innerHTML=aHtml;
+  $("atileTag").textContent=`smem_a: [BK][BM] = ${cfg.BK}×${cfg.BM}（转置）`;
+
+  // B Tile: smem_b 布局 [BK][BN]
+  const bRowSamples=Math.min(cfg.BK,8), bColSamples=Math.min(cfg.BN,12);
+  const bLoadSet=new Set();
+  for(let i=0;i<cfg.BK;i+=SB){
+    for(let v=0;v<VEC;v++){
+      bLoadSet.add((inner_row_b+i)+","+(inner_col_b+v));
+    }
+  }
+  function sampleHasB(sr,sc){
+    const r0=Math.floor(sr*cfg.BK/bRowSamples), r1=Math.floor((sr+1)*cfg.BK/bRowSamples);
+    const c0=Math.floor(sc*cfg.BN/bColSamples), c1=Math.floor((sc+1)*cfg.BN/bColSamples);
+    for(let r=r0;r<Math.max(r1,r0+1);r++)
+      for(let c=c0;c<Math.max(c1,c0+1);c++)
+        if(bLoadSet.has(r+","+c)) return true;
+    return false;
+  }
+  let bHtml="";
+  $("btile").style.gridTemplateColumns=`repeat(${bColSamples},minmax(0,1fr))`;
+  for(let r=0;r<bRowSamples;r++){
+    for(let c=0;c<bColSamples;c++){
+      const r0=Math.floor(r*cfg.BK/bRowSamples), c0=Math.floor(c*cfg.BN/bColSamples);
+      const valid=(BK+r0<cfg.K)&&(b.x*cfg.BN+c0<cfg.N);
+      const loader=sampleHasB(r,c);
+      bHtml+=`<div class="cell ${loader?'loader':''} ${valid?'valid':'invalid'}" title="smem_b[${r0}][${c0}] ← B[${BK+r0}][${b.x*cfg.BN+c0}]">${valid?'B':'0'}</div>`;
+    }
+  }
+  $("btile").innerHTML=bHtml;
+  $("btileTag").textContent=`smem_b: [BK][BN] = ${cfg.BK}×${cfg.BN}（不转置）`;
+
+  // aReg：从 smem_a[dotIdx][thread_row..+TM-1] 读 TM 个连续元素
+  let aRegHtml="";
+  $("areg").style.gridTemplateColumns=`repeat(${Math.min(cfg.TM,8)},minmax(0,1fr))`;
+  for(let i=0;i<Math.min(cfg.TM,8);i++){
+    const asRow=curDotIdx, asCol=tR+i;
+    aRegHtml+=`<div class="cell vec" title="smem_a[${asRow}][${asCol}] = A[${b.y*cfg.BM+asCol}][${BK+asRow}]">a[${i}]<br>smem_a[${asRow}][${asCol}]</div>`;
+  }
+  $("areg").innerHTML=aRegHtml;
+
+  // bReg：从 smem_b[dotIdx][thread_col..+TN-1] 读 TN 个连续元素
+  let bRegHtml="";
+  $("breg").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let j=0;j<Math.min(cfg.TN,8);j++){
+    const bsRow=curDotIdx, bsCol=tC+j;
+    bRegHtml+=`<div class="cell vec-b" title="smem_b[${bsRow}][${bsCol}] = B[${BK+bsRow}][${b.x*cfg.BN+bsCol}]">b[${j}]<br>smem_b[${bsRow}][${bsCol}]</div>`;
+  }
+  $("breg").innerHTML=bRegHtml;
+
+  // tmp
+  let tmpHtml="";
+  $("tmpgrid").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let i=0;i<Math.min(cfg.TM,8);i++){
+    for(let j=0;j<Math.min(cfg.TN,8);j++){
+      tmpHtml+=`<div class="cell tmp-sel" title="tmp[${i}][${j}]">t${i}${j}</div>`;
+    }
+  }
+  $("tmpgrid").innerHTML=tmpHtml;
+
+  // C Tile
+  const cRowSamples=Math.min(cfg.BM,12), cColSamples=Math.min(cfg.BN,12);
+  const cSelSet=new Set();
+  for(let i=0;i<cfg.TM;i++) for(let j=0;j<cfg.TN;j++)
+    cSelSet.add((tR+i)+","+(tC+j));
+  function sampleHasC(sr,sc){
+    const r0=Math.floor(sr*cfg.BM/cRowSamples), r1=Math.floor((sr+1)*cfg.BM/cRowSamples);
+    const c0=Math.floor(sc*cfg.BN/cColSamples), c1=Math.floor((sc+1)*cfg.BN/cColSamples);
+    for(let r=r0;r<Math.max(r1,r0+1);r++)
+      for(let c=c0;c<Math.max(c1,c0+1);c++)
+        if(cSelSet.has(r+","+c)) return true;
+    return false;
+  }
+  let cHtml="";
+  $("ctile").style.gridTemplateColumns=`repeat(${cColSamples},minmax(0,1fr))`;
+  for(let r=0;r<cRowSamples;r++){
+    for(let c=0;c<cColSamples;c++){
+      const r0=Math.floor(r*cfg.BM/cRowSamples), c0=Math.floor(c*cfg.BN/cColSamples);
+      const valid=(b.y*cfg.BM+r0<cfg.M)&&(b.x*cfg.BN+c0<cfg.N);
+      const mine=sampleHasC(r,c);
+      cHtml+=`<div class="cell ${mine?'sel':valid?'valid':'invalid'}" title="C[${b.y*cfg.BM+r0}..][${b.x*cfg.BN+c0}..]">${mine?'●':valid?'C':'0'}</div>`;
+    }
+  }
+  $("ctile").innerHTML=cHtml;
+
+  // 写回映射
+  let wbMapHtml="";
+  $("writebackMap").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let m=0;m<Math.min(cfg.TM,8);m++){
+    for(let n=0;n<Math.min(cfg.TN,8);n++){
+      const row=gRow()+m, col=gCol()+n;
+      const ok=row<cfg.M && col<cfg.N;
+      const isVecStart=(n%VEC===0);
+      wbMapHtml+=`<div class="cell ${isVecStart?'vec':'tmp-sel'}" title="tmp[${m}][${n}] → C[${row}][${col}]">t${m}${n}<br>→C${row},${col}${ok?'':'✗'}</div>`;
+    }
+  }
+  $("writebackMap").innerHTML=wbMapHtml;
+}
+
+function renderVecExplanation(){
+  $("vecExplanation").innerHTML=`
+  <h3>LDG_FLOAT4 / STG_FLOAT4 宏是什么？</h3>
+  <div class="tile-diagram">#define LDG_FLOAT4(ptr) (reinterpret_cast<const float4*>(&(ptr))[0])
+#define STG_FLOAT4(ptr) (reinterpret_cast<float4*>(&(ptr))[0])
+
+它们把“一个 float 的地址”重新解释为“float4 的地址”，然后解引用。
+一次读写 16 字节（4 个连续 float），而不是 4 字节。
+
+  LDG_FLOAT4：读，返回 float4 值（const 安全）
+    float4 v = LDG_FLOAT4(A[i]);        // 读 A[i..i+3] 四个 float
+  STG_FLOAT4：写，返回 float4 左值引用，可赋值
+    STG_FLOAT4(A[i]) = v;               // 写 A[i..i+3] 四个 float
+
+为什么用？减少访存指令数（4 条 LDG 变 1 条 LDG.128），提高 global 访存带宽利用率。
+前提：地址必须 4 字节对齐（float4 要求 16 字节对齐，实际 float 数组基址 16 对齐 + 索引 4 对齐即可）。
+</div>
+
+  <h3 style="margin-top:16px">为什么 A 要转置，B 不转置？</h3>
+  <div class="tile-diagram">外积阶段需要：
+  aReg[i] = A 的第 dotIdx 列，第 thread_row+i 行   → 按列取
+  bReg[j] = B 的第 dotIdx 行，第 thread_col+j 列   → 按行取
+
+【B 不转置：smem_b[BK][BN]】
+  bReg 取的是 smem_b[dotIdx][thread_col .. thread_col+TN-1]
+  固定行 dotIdx，连续列 → 在 smem_b 中连续 → 可以用 float4 读，也可以用 float4 写。
+
+【A 转置：smem_a[BK][BM]】
+  aReg 取的是 A 的第 dotIdx 列、thread_row..thread_row+TM-1 行。
+  如果 smem_a 不转置（[BM][BK]），这些元素在 smem 中跨行（步长 BK），不连续，无法 float4 读。
+  转置成 smem_a[BK][BM] 后，这些元素变成 smem_a[dotIdx][thread_row..] → 同一行连续，
+  可以用 float4 读。
+
+代价：加载 A 时，从 global 读的是 A 的一行 4 个连续 float（float4 读），
+但写入 smem_a 时需要转置 → 4 个元素在 smem_a 中不连续 → 只能 4 次标量写。
+这就是“向量化读、转置写”的问题：读向量化了，写退化成标量。
+</div>
+
+  <div class="explain-box warn">
+    <b>一句话总结</b>：转置 A 是为了让外积阶段的 aReg 能按列 float4 读；
+    代价是加载阶段 A 的 float4 读不能直接 float4 写 smem。B 因为外积本身按行取，不需要转置，加载和读取都能 float4。
+  </div>
+
+  <div class="explain-box good">
+    <b>外积阶段</b>：aReg 和 bReg 都用 LDG_FLOAT4 从 smem 读，但乘加仍是标量（tmp[i][j] += aReg[i]*bReg[j]）。
+    float4 只优化访存，不优化计算。要优化计算需要 tensor core 或更复杂的指令级并行。
+  </div>
+</div>`;
+}
+
+function renderCode(){
+  const code=`// 宏：把 float 地址重解释为 float4 地址，一次读写 16 字节
+#define LDG_FLOAT4(ptr) (reinterpret_cast<const float4*>(&(ptr))[0])
+#define STG_FLOAT4(ptr) (reinterpret_cast<float4*>(&(ptr))[0])
+
+__shared__ float smem_a[BK * BM];   // 转置布局 [BK][BM]
+__shared__ float smem_b[BK * BN];   // 不转置 [BK][BN]
+
+const uint inner_row_a = threadIdx.x / (BK / VEC);
+const uint inner_col_a = (threadIdx.x % (BK / VEC)) * VEC;
+const uint inner_row_b = threadIdx.x / (BN / VEC);
+const uint inner_col_b = (threadIdx.x % (BN / VEC)) * VEC;
+
+for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // A: float4 读，转置写 4 次标量
+    float ldg_reg_a[LDG_A_NUM * VEC];
+    for (int i = 0; i < BM; i += STRIDE_A) {
+        const int ldg_index = i / STRIDE_A * VEC;
+        STG_FLOAT4(ldg_reg_a[ldg_index]) =
+            LDG_FLOAT4(A[OFFSET(i + inner_row_a, inner_col_a, K)]);
+        smem_a[OFFSET(inner_col_a + 0, i + inner_row_a, BM)] = ldg_reg_a[ldg_index + 0];
+        smem_a[OFFSET(inner_col_a + 1, i + inner_row_a, BM)] = ldg_reg_a[ldg_index + 1];
+        smem_a[OFFSET(inner_col_a + 2, i + inner_row_a, BM)] = ldg_reg_a[ldg_index + 2];
+        smem_a[OFFSET(inner_col_a + 3, i + inner_row_a, BM)] = ldg_reg_a[ldg_index + 3];
+    }
+    // B: float4 读，float4 写
+    for (int i = 0; i < BK; i += STRIDE_B) {
+        STG_FLOAT4(smem_b[OFFSET(inner_row_b + i, inner_col_b, BN)]) =
+            LDG_FLOAT4(B[OFFSET(inner_row_b + i, inner_col_b, N)]);
+    }
+
+    __syncthreads();
+
+    // 外积：aReg 从 smem_a 按列 float4 读，bReg 从 smem_b 按行 float4 读
+    for (uint dot_idx = 0; dot_idx < BK; ++dot_idx) {
+        float reg_a[TM];
+        for (int m = 0; m < TM; m += VEC)
+            STG_FLOAT4(reg_a[m]) = LDG_FLOAT4(smem_a[OFFSET(dot_idx, thread_row + m, BM)]);
+        float reg_b[TN];
+        for (int n = 0; n < TN; n += VEC)
+            STG_FLOAT4(reg_b[n]) = LDG_FLOAT4(smem_b[OFFSET(dot_idx, thread_col + n, BN)]);
+        for (int m = 0; m < TM; ++m)
+            for (int n = 0; n < TN; ++n)
+                thread_results[m * TN + n] += reg_a[m] * reg_b[n];
+    }
+
+    __syncthreads();
+    A += BK;
+    B += BK * N;
+}
+
+// 向量化写回
+for (int m = 0; m < TM; ++m)
+    for (int n = 0; n < TN; n += VEC)
+        STG_FLOAT4(C[OFFSET(thread_row + m, thread_col + n, N)]) =
+            LDG_FLOAT4(thread_results[m * TN + n]);`;
+  $("code").innerHTML=`<pre>${code.replaceAll("&","&amp;").replaceAll("<","&lt;")}</pre>
+  <p class="small">smem_a 转置存放是为了外积阶段 aReg 能按列 float4 读；代价是加载 A 时只能标量写 smem_a。smem_b 不转置，加载和读取都能 float4。</p>`;
+}
+
+document.addEventListener("click",e=>{
+  let s=e.target.closest("[data-stage]");
+  if(s){stage=+s.dataset.stage;render();return}
+  let b=e.target.closest("[data-block]");
+  if(b){let [x,y]=b.dataset.block.split(",").map(Number);block={x,y};render();return}
+  let t=e.target.closest("[data-thread]");
+  if(t){thread.x=+t.dataset.thread;render();return}
+});
+
+$("prev").onclick=()=>{stage=Math.max(0,stage-1);render()};
+$("next").onclick=()=>{
+  if(stage===4){
+    if(curDotIdx+1<cfg.BK){curDotIdx++;render();return;}
+  }
+  if(stage===6){
+    if(kTile+1<Math.ceil(cfg.K/cfg.BK)){kTile++;stage=1;curDotIdx=0;}
+    else stage=7;
+  } else stage=Math.min(maxStage(),stage+1);
+  render();
+};
+$("reset").onclick=()=>{stage=0;curDotIdx=0;render()};
+
+$("apply").onclick=()=>{
+  let M=+$("M").value,N=+$("N").value,K=+$("K").value;
+  let BM=+$("BM").value,BN=+$("BN").value,BK=+$("BK").value,TM=+$("TM").value,TN=+$("TN").value;
+  if(![M,N,K,BM,BN,BK,TM,TN].every(Number.isInteger)||
+     M<1||N<1||K<1||BM<4||BN<4||BK<4||TM<4||TN<4){
+    alert("请输入有效尺寸，且 BM/BN/BK/TM/TN 均为 ≥4 的整数（4 的倍数以支持 float4）。");return;
+  }
+  if(BM%TM!==0||BN%TN!==0||BM%4!==0||BN%4!==0||BK%4!==0||TM%4!==0||TN%4!==0){
+    alert("要求 BM%TM==0、BN%TN==0，且 BM/BN/BK/TM/TN 均为 4 的倍数。");return;
+  }
+  const NT=(BM*BN)/(TM*TN);
+  const ldgA=(BM*BK)/NT/4, ldgB=(BK*BN)/NT/4;
+  if(!Number.isInteger(NT)||!Number.isInteger(ldgA)||!Number.isInteger(ldgB)||ldgA<1||ldgB<1){
+    alert(`NUM_THREADS=${NT}，LDG_A_NUM=${ldgA}，LDG_B_NUM=${ldgB}，需均为正整数。`);return;
+  }
+  cfg={M,N,K,BM,BN,BK,TM,TN};
+  block={x:0,y:0};thread={x:0};stage=0;kTile=0;curDotIdx=0;
+  render();
+};
+
+render();
+</script>
+</body></html>

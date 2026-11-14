@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Matrix Multiplication Visualizer - Shared 2D Tile</title>
+<style>
+:root{--bg:#0b1020;--panel:#141c30;--panel2:#1b2740;--line:#2c3a56;--text:#e9efff;--muted:#a8b5d1;--blue:#63a8ff;--orange:#ffbf69;--green:#59d6a2;--red:#ff8585;--purple:#b48cff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{padding:24px max(20px,calc((100vw - 1240px)/2));background:linear-gradient(120deg,#142443,#101729);border-bottom:1px solid var(--line)}
+h1{margin:0 0 6px;font-size:26px}h2{font-size:19px;margin:0 0 12px}h3{font-size:16px;margin:0 0 8px}.sub{color:var(--muted)}
+main{max-width:1240px;margin:22px auto;padding:0 18px 50px;display:grid;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+label{display:grid;gap:4px;color:var(--muted);font-size:13px}
+input,select,button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit}
+input{width:90px}button{cursor:pointer}button:hover{border-color:var(--blue)}button.primary{background:#1b4778;border-color:#367dc3}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.kpi{background:var(--panel2);padding:10px;border-radius:10px}.kpi b{display:block;font-size:19px}
+.small{font-size:13px;color:var(--muted)}.formula{font-family:ui-monospace,Consolas,monospace;background:#0d1526;border:1px solid var(--line);padding:10px;border-radius:9px;overflow-wrap:anywhere}
+.matrix{display:grid;gap:3px}.cell{background:#202d45;border-radius:4px;text-align:center;padding:5px 1px;font:11px ui-monospace,monospace;color:#cbd8f3;min-width:0}.cell.sel{outline:2px solid var(--green);background:#245a50}.cell.valid{background:#23466b}.cell.invalid{background:#54343a;color:#ffd0d0}.cell.loader{outline:2px dashed var(--orange);outline-offset:-2px}.cell.areg{background:#2a4a2a;color:#a8ffb0}.cell.breg{background:#4a3a2a;color:#ffd9a8}.cell.tmp{background:#2a2a4a;color:#b0a8ff}.cell.tmp-sel{outline:2px solid var(--purple);background:#3a2a5a}
+.steps{display:flex;gap:5px;flex-wrap:wrap}.steps button{font-size:12px;padding:6px 9px}.steps button.active{border-color:var(--green);background:#19483f}
+.good{color:var(--green)}.warn{color:var(--orange)}.bad{color:var(--red)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0d1526;border:1px solid var(--line);border-radius:9px;padding:12px;margin:8px 0;font:12px/1.55 ui-monospace,Consolas,monospace}
+.pointer-advance{background:#0d1526;border:1px solid var(--line);padding:12px;border-radius:9px;font-family:ui-monospace,Consolas,monospace}
+.pointer-advance .step{display:flex;gap:10px;margin-bottom:8px;align-items:flex-start}
+.pointer-advance .step-num{background:#244d7c;color:white;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;margin-top:1px}
+.tile-diagram{background:#0d1526;border:1px solid var(--line);border-radius:9px;padding:12px;font:12px/1.6 ui-monospace,Consolas,monospace;white-space:pre;overflow-x:auto;color:#cbd8f3}
+.explain-box{background:#10192b;border-left:3px solid var(--blue);padding:10px 14px;border-radius:0 8px 8px 0;margin:10px 0}
+.explain-box.warn{border-left-color:var(--orange)}
+.explain-box.good{border-left-color:var(--green)}
+.loader-table{width:100%;border-collapse:collapse;font:12px ui-monospace,Consolas,monospace;margin-top:6px}
+.loader-table td,.loader-table th{border:1px solid var(--line);padding:4px 8px;text-align:center}
+.loader-table th{background:#10192b;color:var(--muted)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}
+.legend span{display:flex;align-items:center;gap:4px}
+.legend .dot{width:10px;height:10px;border-radius:2px;display:inline-block}
+.tile-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.tile-header .tag{font-size:11px;padding:2px 6px;border-radius:4px;background:#263752;color:#cfe2ff}
+@media(max-width:850px){.grid2,.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>CUDA Matrix Multiplication Visualizer</h1><div class="sub">Shared Memory + 2D Thread Tile · A 跨行（列固定）· B 跨行（列固定）· aReg 按列取 · bReg 按行取 · 全链路图 · 中文交互教学版</div></header>
+<main>
+<section class="panel">
+<h2>1. 配置实验</h2>
+<div class="controls">
+<label>M<input id="M" type="number" min="1" max="256" value="64"></label>
+<label>N<input id="N" type="number" min="1" max="256" value="64"></label>
+<label>K<input id="K" type="number" min="1" max="256" value="64"></label>
+<label>BM<input id="BM" type="number" min="2" max="32" value="32"></label>
+<label>BN<input id="BN" type="number" min="2" max="32" value="32"></label>
+<label>BK<input id="BK" type="number" min="2" max="16" value="8"></label>
+<label>TM<input id="TM" type="number" min="1" max="8" value="4"></label>
+<label>TN<input id="TN" type="number" min="1" max="8" value="4"></label>
+<button class="primary" id="apply">应用配置</button>
+</div>
+<p class="small">默认 M=N=K=64，BM=BN=32，BK=8，TM=TN=4：NUM_THREADS=64，THREAD_COLS=8，STRIDE_A=8，STRIDE_B=2。A 每线程搬 4 个（同列、行间隔 8）；B 每线程搬 4 个（同列、行间隔 2）。</p>
+<div class="kpis" id="kpis"></div>
+</section>
+
+<section class="panel">
+<h2>2. 执行阶段</h2>
+<div class="steps" id="steps"></div>
+<div class="controls" style="margin-top:12px">
+<button id="prev">← 上一步</button><button class="primary" id="next">下一步 →</button><button id="reset">重置</button>
+<span class="small" id="stageCounter"></span>
+</div>
+<div id="stageDesc" style="margin-top:12px"></div>
+</section>
+
+<section class="panel">
+<h2>3. Grid / Block / Thread 导航</h2>
+<div class="grid2">
+<div>
+<h3>Grid 中的 Block</h3><div id="blockGrid" class="matrix"></div>
+<p class="small">横向 blockIdx.x（BN 方向），纵向 blockIdx.y（BM 方向）。每个 Block 负责 C 的 BM 行 × BN 列。</p>
+</div>
+<div>
+<h3>当前 Block 的 Thread（NUM_THREADS 个，一维）</h3><div id="threadGrid" class="matrix"></div>
+<p class="small">点击 Thread 查看其 TM×TN 输出块。一维编号：threadIdx.x = thread_row×THREAD_COLS + thread_col。</p>
+</div>
+</div>
+</section>
+
+<section class="panel">
+<h2>4. 当前 Thread 的精确计算过程</h2>
+<div class="kpis" id="threadKpis"></div>
+<div class="grid2" style="margin-top:12px">
+<div><h3>坐标映射与负责的 TM×TN 输出块</h3><div id="mapping"></div></div>
+<div><h3>当前阶段的操作</h3><div id="operation"></div></div>
+</div>
+<div style="margin-top:12px"><h3>迭代加载：inner_row/col + STRIDE_A/B</h3><div id="loads"></div></div>
+<div style="margin-top:12px"><h3>外积累加：TM×TN</h3><div id="accum"></div></div>
+<div style="margin-top:12px"><h3>指针推进与 K Tile</h3><div id="pointerAdvance" class="pointer-advance"></div></div>
+<div style="margin-top:12px"><h3>最终写回 C</h3><div id="writeback"></div></div>
+</section>
+
+<section class="panel">
+<h2>5. 全链路数据流可视化</h2>
+<div class="legend">
+  <span><span class="dot" style="background:#23466b"></span>有效数据</span>
+  <span><span class="dot" style="background:#54343a"></span>越界补0</span>
+  <span><span class="dot" style="background:#245a50;outline:2px solid var(--green)"></span>选中/负责</span>
+  <span><span class="dot" style="background:transparent;border:2px dashed var(--orange)"></span>本线程加载（同列跨行）</span>
+  <span><span class="dot" style="background:#2a4a2a"></span>aReg（按列取）</span>
+  <span><span class="dot" style="background:#4a3a2a"></span>bReg（按行取）</span>
+  <span><span class="dot" style="background:#2a2a4a"></span>tmp</span>
+</div>
+
+<div class="grid2" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header">
+      <h3>A Tile（As，共享内存）</h3><span class="tag" id="atileTag"></span>
+    </div>
+    <div id="atile" class="matrix"></div>
+    <p class="small">橙色虚线框=本线程加载的 4 个元素：<b>同一列 inner_col_A，行号 inner_row_A + k·STRIDE_A（k=0..3）</b>。A 是跨行（列固定）。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header">
+      <h3>B Tile（Bs，共享内存）</h3><span class="tag" id="btileTag"></span>
+    </div>
+    <div id="btile" class="matrix"></div>
+    <p class="small">橙色虚线框=本线程加载的 4 个元素：<b>同一列 inner_col_B，行号 inner_row_B + k·STRIDE_B（k=0..3）</b>。B 也是跨行（列固定），只是 B tile 行数少、列数多。</p>
+  </div>
+</div>
+
+<div class="grid3" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>aReg[TM]</h3><span class="tag">TM 个，按列取</span></div>
+    <div id="areg" class="matrix"></div>
+    <p class="small">aReg[i] = As[(thread_row·TM+i)·BK + dotIdx]：固定 dotIdx 列，取 thread_row·TM+i 行。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>bReg[TN]</h3><span class="tag">TN 个，按行取</span></div>
+    <div id="breg" class="matrix"></div>
+    <p class="small">bReg[j] = Bs[dotIdx·BN + thread_col·TN+j]：固定 dotIdx 行，取 thread_col·TN+j 列。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>tmp[TM][TN]</h3><span class="tag">TM×TN</span></div>
+    <div id="tmpgrid" class="matrix"></div>
+    <p class="small">tmp[i][j] += aReg[i]·bReg[j]，外积累加。当前展示 dotIdx 轮。</p>
+  </div>
+</div>
+
+<div class="grid2" style="margin-top:12px">
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>C Tile（输出，全局内存）</h3><span class="tag">BM×BN</span></div>
+    <div id="ctile" class="matrix"></div>
+    <p class="small">绿色=本线程负责的 TM×TN 输出块。</p>
+  </div>
+  <div class="panel" style="background:var(--panel2)">
+    <div class="tile-header"><h3>写回映射：tmp → C</h3><span class="tag">TM×TN</span></div>
+    <div id="writebackMap" class="matrix"></div>
+    <p class="small">每个 tmp[i][j] 写到 C 的 (gRow+i, gCol+j)，越界则跳过。</p>
+  </div>
+</div>
+</section>
+
+<section class="panel">
+<h2>6. 2D Tiling 图解</h2>
+<div id="tilingExplanation"></div>
+</section>
+
+<section class="panel">
+<h2>7. 关键代码对照</h2><div id="code"></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let cfg={M:64,N:64,K:64,BM:32,BN:32,BK:8,TM:4,TN:4};
+let stage=0, kTile=0, block={x:0,y:0}, thread={x:0};
+let curDotIdx=0;
+
+const stages=[
+  "Block / Thread 坐标映射",
+  "迭代加载 A、B Tile（STRIDE_A/B）",
+  "第一次 __syncthreads()",
+  "外积累加（TM×TN）",
+  "第二次 __syncthreads()",
+  "推进 K 到下一个 Tile",
+  "写回 C（TM×TN）"
+];
+
+function NUM_THREADS(){return (cfg.BM*cfg.BN)/(cfg.TM*cfg.TN)}
+function THREAD_COLS(){return cfg.BN/cfg.TN}
+function STRIDE_A(){return NUM_THREADS()/cfg.BK}
+function STRIDE_B(){return NUM_THREADS()/cfg.BN}
+function gridX(){return Math.ceil(cfg.N/cfg.BN)}
+function gridY(){return Math.ceil(cfg.M/cfg.BM)}
+function threadRow(){return Math.floor(thread.x/THREAD_COLS())}
+function threadCol(){return thread.x%THREAD_COLS()}
+function gRow(){return block.y*cfg.BM+threadRow()*cfg.TM}
+function gCol(){return block.x*cfg.BN+threadCol()*cfg.TN}
+function maxStage(){return stages.length-1}
+function stageName(){return stages[stage]}
+
+function render(){
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  $("kpis").innerHTML=[
+    ["Grid",`${gridX()} × ${gridY()}`],
+    ["NUM_THREADS",NT],
+    ["THREAD_COLS",TC],
+    ["STRIDE_A",SA],
+    ["STRIDE_B",SB],
+    ["A Tile",`${cfg.BM}×${cfg.BK}`],
+    ["B Tile",`${cfg.BK}×${cfg.BN}`],
+    ["C Tile",`${cfg.BM}×${cfg.BN}`]
+  ].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+
+  $("steps").innerHTML=stages.map((n,i)=>`<button data-stage="${i}" class="${i===stage?"active":""}">${i+1}. ${n}</button>`).join("");
+  $("stageCounter").textContent=`阶段 ${stage+1}/${stages.length}：${stageName()}`;
+  $("stageDesc").innerHTML=description();
+
+  const maxGridShow=8;
+  $("blockGrid").style.gridTemplateColumns=`repeat(${Math.min(gridX(),maxGridShow)},minmax(0,1fr))`;
+  $("blockGrid").innerHTML=Array.from({length:gridX()*gridY()},(_,i)=>{
+    let x=i%gridX(),y=Math.floor(i/gridX());
+    let sel=x===block.x&&y===block.y;
+    return `<button class="cell ${sel?"sel":""}" data-block="${x},${y}">B(${x},${y})</button>`
+  }).join("");
+
+  const showThreads=Math.min(NT,64);
+  $("threadGrid").style.gridTemplateColumns=`repeat(${Math.min(TC,8)},minmax(0,1fr))`;
+  $("threadGrid").innerHTML=Array.from({length:showThreads},(_,i)=>{
+    let sel=i===thread.x;
+    let r=Math.floor(i/TC), c=i%TC;
+    return `<button class="cell ${sel?"sel":""}" data-thread="${i}">#${i}<br>r${r}c${c}</button>`
+  }).join("");
+
+  renderDetails();renderTiles();renderTiling();renderCode();
+}
+
+function description(){
+  const p={row:gRow(),col:gCol()}, b=block, BK=kTile*cfg.BK;
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+  const texts=[
+    `Block (${b.x},${b.y}) 负责 C 的 行 [${b.y*cfg.BM}, ${Math.min((b.y+1)*cfg.BM,cfg.M)-1}] × 列 [${b.x*cfg.BN}, ${Math.min((b.x+1)*cfg.BN,cfg.N)-1}]。<br>
+     threadIdx.x=${thread.x} → thread_col = ${thread.x} % ${TC} = ${tC}，thread_row = floor(${thread.x}/${TC}) = ${tR}。<br>
+     负责 C 的 TM×TN=${cfg.TM}×${cfg.TN} 输出块，左上角 (gRow=${p.row}, gCol=${p.col})。`,
+    `bkIdx=${BK}。<br>
+     <b>A 迭代加载</b>：inner_row_A=${Math.floor(thread.x/cfg.BK)}，inner_col_A=${thread.x%cfg.BK}，STRIDE_A=${SA}。列固定，行 = inner_row_A + k·${SA}（k=0..3）。<br>
+     <b>B 迭代加载</b>：inner_row_B=${Math.floor(thread.x/cfg.BN)}，inner_col_B=${thread.x%cfg.BN}，STRIDE_B=${SB}。列固定，行 = inner_row_B + k·${SB}（k=0..3）。`,
+    `__syncthreads() 同步，确保 As、Bs 全部写好。`,
+    `外积累加：对 dotIdx=0..${cfg.BK-1}，<b>aReg 按列取</b>（固定 dotIdx 列，取 thread_row·TM+i 行），<b>bReg 按行取</b>（固定 dotIdx 行，取 thread_col·TN+j 列），tmp[i][j] += aReg[i]·bReg[j]。`,
+    `第二次 __syncthreads()，防止快线程提前覆盖 shared。`,
+    `A 指针 += BK=${cfg.BK}；B 指针 += BK×N=${cfg.BK*cfg.N}。下一轮 bkIdx=${Math.min(BK+cfg.BK,cfg.K)}。`,
+    `写回 C：TM×TN 个结果，边界检查 row<M 且 col<N。`
+  ];
+  return `<p>${texts[stage]}</p>`;
+}
+
+function renderDetails(){
+  const p={row:gRow(),col:gCol()}, b=block, BK=kTile*cfg.BK;
+  const NT=NUM_THREADS(), TC=THREAD_COLS(), SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+
+  $("threadKpis").innerHTML=[
+    ["blockIdx",`(${b.x}, ${b.y})`],
+    ["threadIdx.x",thread.x],
+    ["thread_row / col",`${tR} / ${tC}`],
+    ["TM×TN",`${cfg.TM}×${cfg.TN}`],
+    ["gRow / gCol",`${p.row} / ${p.col}`],
+    ["STRIDE_A",SA],
+    ["STRIDE_B",SB],
+    ["dotIdx",curDotIdx]
+  ].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+
+  $("mapping").innerHTML=`<div class="formula">
+c_row = blockIdx.y = ${b.y}，c_col = blockIdx.x = ${b.x}<br>
+THREAD_COLS = BN/TN = ${cfg.BN}/${cfg.TN} = ${TC}<br>
+thread_col = threadIdx.x % THREAD_COLS = ${thread.x} % ${TC} = ${tC}<br>
+thread_row = threadIdx.x / THREAD_COLS = floor(${thread.x}/${TC}) = ${tR}<br>
+gRow = c_row × BM + thread_row × TM = ${p.row}<br>
+gCol = c_col × BN + thread_col × TN = ${p.col}<br>
+负责输出块：C[${p.row}..${p.row+cfg.TM-1}][${p.col}..${p.col+cfg.TN-1}]
+</div>`;
+
+  $("operation").innerHTML=`<div class="formula">
+输出块：C 的 ${cfg.TM} 行 × ${cfg.TN} 列<br>
+一维线程编号：${thread.x} = ${tR} × ${TC} + ${tC}<br>
+Block 覆盖行：[${b.y*cfg.BM}, ${Math.min((b.y+1)*cfg.BM,cfg.M)-1}]<br>
+Block 覆盖列：[${b.x*cfg.BN}, ${Math.min((b.x+1)*cfg.BN,cfg.N)-1}]<br>
+K Tile 起点 bkIdx=${BK}，BK=${cfg.BK}
+</div>`;
+
+  // 迭代加载表格
+  const inner_row_A=Math.floor(thread.x/cfg.BK), inner_col_A=thread.x%cfg.BK;
+  const inner_row_B=Math.floor(thread.x/cfg.BN), inner_col_B=thread.x%cfg.BN;
+  let aRows=[], bRows=[];
+  for(let off=0;off<cfg.BM;off+=SA){
+    const aRow=inner_row_A+off, aCol=inner_col_A;
+    const valid=(b.y*cfg.BM+aRow<cfg.M)&&(BK+aCol<cfg.K);
+    aRows.push({aRow,aCol,valid,off});
+  }
+  for(let off=0;off<cfg.BK;off+=SB){
+    const bRow=inner_row_B+off, bCol=inner_col_B;
+    const valid=(BK+bRow<cfg.K)&&(b.x*cfg.BN+bCol<cfg.N);
+    bRows.push({bRow,bCol,valid,off});
+  }
+
+  let aTable=`<table class="loader-table"><tr><th>k</th><th>offset</th><th>aRow</th><th>aCol</th><th>As 下标</th><th>全局 A 坐标</th><th>有效?</th></tr>`;
+  aRows.forEach((r,k)=>{
+    aTable+=`<tr><td>${k}</td><td>${r.off}</td><td>${r.aRow}</td><td>${r.aCol}</td><td>${r.aRow*cfg.BK+r.aCol}</td><td>A[${b.y*cfg.BM+r.aRow}][${BK+r.aCol}]</td><td class="${r.valid?'good':'bad'}">${r.valid?'✓':'补0'}</td></tr>`;
+  });
+  aTable+=`</table>`;
+
+  let bTable=`<table class="loader-table"><tr><th>k</th><th>offset</th><th>bRow</th><th>bCol</th><th>Bs 下标</th><th>全局 B 坐标</th><th>有效?</th></tr>`;
+  bRows.forEach((r,k)=>{
+    bTable+=`<tr><td>${k}</td><td>${r.off}</td><td>${r.bRow}</td><td>${r.bCol}</td><td>${r.bRow*cfg.BN+r.bCol}</td><td>B[${BK+r.bRow}][${b.x*cfg.BN+r.bCol}]</td><td class="${r.valid?'good':'bad'}">${r.valid?'✓':'补0'}</td></tr>`;
+  });
+  bTable+=`</table>`;
+
+  $("loads").innerHTML=`
+  <div class="formula">
+  <b>A：列固定 inner_col_A=${inner_col_A}，行 = ${inner_row_A} + k·STRIDE_A(${SA})，k=0..${aRows.length-1}</b><br>
+  <b>B：列固定 inner_col_B=${inner_col_B}，行 = ${inner_row_B} + k·STRIDE_B(${SB})，k=0..${bRows.length-1}</b>
+  </div>
+  <h3 style="margin-top:12px">A 迭代加载（同列跨行，${aRows.length} 个）</h3>${aTable}
+  <h3 style="margin-top:12px">B 迭代加载（同列跨行，${bRows.length} 个）</h3>${bTable}
+  <p class="small">A、B 的加载方向一致：列固定，沿行跳着搬。区别只是 STRIDE_A=8（A tile 行多 BM=32）、STRIDE_B=2（B tile 行少 BK=8）。</p>`;
+
+  $("accum").innerHTML=`<div class="formula">
+tmp[${cfg.TM}][${cfg.TN}]，当前 dotIdx=${curDotIdx}<br>
+<b>aReg 按列取</b>：aReg[i] = As[(thread_row·TM + i)·BK + ${curDotIdx}]，i=0..${cfg.TM-1}<br>
+&nbsp;&nbsp;→ 行号 ${tR*cfg.TM}..${tR*cfg.TM+cfg.TM-1}，列固定 ${curDotIdx}<br>
+<b>bReg 按行取</b>：bReg[j] = Bs[${curDotIdx}·BN + thread_col·TN + j]，j=0..${cfg.TN-1}<br>
+&nbsp;&nbsp;→ 行固定 ${curDotIdx}，列号 ${tC*cfg.TN}..${tC*cfg.TN+cfg.TN-1}<br>
+tmp[i][j] += aReg[i] × bReg[j]<br><br>
+aReg[i] 被 TN=${cfg.TN} 个输出复用；bReg[j] 被 TM=${cfg.TM} 个输出复用。
+</div>`;
+
+  const nextBk=Math.min(BK+cfg.BK,cfg.K);
+  $("pointerAdvance").innerHTML=`
+    <div class="step"><span class="step-num">1</span><span>当前 K Tile：<b>bkIdx = ${BK}</b>，BK = ${cfg.BK}</span></div>
+    <div class="step"><span class="step-num">2</span><span>A 加载：读 A[(inner_row_A+k·${SA})·K + inner_col_A]，列固定 ${inner_col_A}</span></div>
+    <div class="step"><span class="step-num">3</span><span>B 加载：读 B[(inner_row_B+k·${SB})·N + inner_col_B]，列固定 ${inner_col_B}</span></div>
+    <div class="step"><span class="step-num">4</span><span>指针推进：A += BK=${cfg.BK}；B += BK×N=${cfg.BK*cfg.N}。下一轮 bkIdx=${nextBk}${nextBk>=cfg.K?' <span class="bad">(K 末尾)</span>':' <span class="good">(继续)</span>'}</span></div>`;
+
+  let wb=`<div class="formula">对 i=0..${cfg.TM-1}，j=0..${cfg.TN-1}：<br>`;
+  for(let i=0;i<cfg.TM;i++){
+    for(let j=0;j<cfg.TN;j++){
+      const row=p.row+i, col=p.col+j;
+      const ok=row<cfg.M&&col<cfg.N;
+      wb+=`C[${row}][${col}] ${ok?'<span class="good">← tmp['+i+']['+j+']</span>':'<span class="bad">越界不写</span>'}<br>`;
+    }
+  }
+  wb+=`</div>`;
+  $("writeback").innerHTML=wb;
+}
+
+/* ========== 全链路 Tile 可视化 ========== */
+function renderTiles(){
+  const b=block, BK=kTile*cfg.BK;
+  const SA=STRIDE_A(), SB=STRIDE_B();
+  const tR=threadRow(), tC=threadCol();
+
+  // ---------- A Tile: BM × BK ----------
+  // 采样：行取 min(BM,12)，列取 min(BK,8)。虚框按真实坐标判断，不依赖采样映射。
+  const aRowSamples=Math.min(cfg.BM,12), aColSamples=Math.min(cfg.BK,8);
+  const inner_row_A=Math.floor(thread.x/cfg.BK), inner_col_A=thread.x%cfg.BK;
+  // 本线程加载的 As 真实坐标集合
+  const aLoadSet=new Set();
+  for(let off=0;off<cfg.BM;off+=SA){
+    aLoadSet.add((inner_row_A+off)+","+inner_col_A);
+  }
+  // 采样格 -> 是否包含本线程加载的真实坐标
+  function sampleHasA(sr,sc){
+    const r0=Math.floor(sr*cfg.BM/aRowSamples), r1=Math.floor((sr+1)*cfg.BM/aRowSamples);
+    const c0=Math.floor(sc*cfg.BK/aColSamples), c1=Math.floor((sc+1)*cfg.BK/aColSamples);
+    for(let r=r0;r<Math.max(r1,r0+1);r++)
+      for(let c=c0;c<Math.max(c1,c0+1);c++)
+        if(aLoadSet.has(r+","+c)) return true;
+    return false;
+  }
+  // 采样格代表的有效性（取格内第一个坐标）
+  function sampleValidA(sr,sc){
+    const r0=Math.floor(sr*cfg.BM/aRowSamples), c0=Math.floor(sc*cfg.BK/aColSamples);
+    return (b.y*cfg.BM+r0<cfg.M)&&(BK+c0<cfg.K);
+  }
+  let aHtml="";
+  $("atile").style.gridTemplateColumns=`repeat(${aColSamples},minmax(0,1fr))`;
+  for(let r=0;r<aRowSamples;r++){
+    for(let c=0;c<aColSamples;c++){
+      const loader=sampleHasA(r,c);
+      const valid=sampleValidA(r,c);
+      const r0=Math.floor(r*cfg.BM/aRowSamples), c0=Math.floor(c*cfg.BK/aColSamples);
+      aHtml+=`<div class="cell ${loader?'loader':''} ${valid?'valid':'invalid'}" title="A[${b.y*cfg.BM+r0}..][${BK+c0}..]">${valid?'A':'0'}</div>`;
+    }
+  }
+  $("atile").innerHTML=aHtml;
+  $("atileTag").textContent=`${cfg.BM}×${cfg.BK}`;
+
+  // ---------- B Tile: BK × BN ----------
+  // B 列很多（BN=32），为了看清“同列跨行”，用局部窗口：围绕 inner_col_B 显示 8 列
+  const inner_row_B=Math.floor(thread.x/cfg.BN), inner_col_B=thread.x%cfg.BN;
+  const bWindowCols=Math.min(cfg.BN,8);
+  let bColStart=Math.floor(inner_col_B - bWindowCols/2);
+  bColStart=Math.max(0,Math.min(cfg.BN-bWindowCols,bColStart));
+  const bRowSamples=Math.min(cfg.BK,8);
+
+  const bLoadSet=new Set();
+  for(let off=0;off<cfg.BK;off+=SB){
+    bLoadSet.add((inner_row_B+off)+","+inner_col_B);
+  }
+  let bHtml="";
+  $("btile").style.gridTemplateColumns=`repeat(${bWindowCols},minmax(0,1fr))`;
+  for(let r=0;r<bRowSamples;r++){
+    for(let c=0;c<bWindowCols;c++){
+      const realRow=Math.floor(r*cfg.BK/bRowSamples);
+      const realCol=bColStart+c;
+      const loader=bLoadSet.has(realRow+","+realCol);
+      const valid=(BK+realRow<cfg.K)&&(b.x*cfg.BN+realCol<cfg.N);
+      bHtml+=`<div class="cell ${loader?'loader':''} ${valid?'valid':'invalid'}" title="B[${BK+realRow}][${b.x*cfg.BN+realCol}]">${valid?'B':'0'}</div>`;
+    }
+  }
+  $("btile").innerHTML=bHtml;
+  $("btileTag").textContent=`${cfg.BK}×${cfg.BN}（窗口列 ${bColStart}..${bColStart+bWindowCols-1}）`;
+
+  // ---------- aReg[TM]：按列取 ----------
+  let aRegHtml="";
+  $("areg").style.gridTemplateColumns=`repeat(${Math.min(cfg.TM,8)},minmax(0,1fr))`;
+  for(let i=0;i<Math.min(cfg.TM,8);i++){
+    const asRow=tR*cfg.TM+i;
+    aRegHtml+=`<div class="cell areg" title="As[${asRow}][${curDotIdx}] = A[${b.y*cfg.BM+asRow}][${BK+curDotIdx}]">a[${i}]<br>r${asRow}c${curDotIdx}</div>`;
+  }
+  $("areg").innerHTML=aRegHtml;
+
+  // ---------- bReg[TN]：按行取 ----------
+  let bRegHtml="";
+  $("breg").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let j=0;j<Math.min(cfg.TN,8);j++){
+    const bsCol=tC*cfg.TN+j;
+    bRegHtml+=`<div class="cell breg" title="Bs[${curDotIdx}][${bsCol}] = B[${BK+curDotIdx}][${b.x*cfg.BN+bsCol}]">b[${j}]<br>r${curDotIdx}c${bsCol}</div>`;
+  }
+  $("breg").innerHTML=bRegHtml;
+
+  // ---------- tmp ----------
+  let tmpHtml="";
+  $("tmpgrid").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let i=0;i<Math.min(cfg.TM,8);i++){
+    for(let j=0;j<Math.min(cfg.TN,8);j++){
+      tmpHtml+=`<div class="cell tmp-sel" title="tmp[${i}][${j}]">t${i}${j}</div>`;
+    }
+  }
+  $("tmpgrid").innerHTML=tmpHtml;
+
+  // ---------- C Tile ----------
+  const cRowSamples=Math.min(cfg.BM,12), cColSamples=Math.min(cfg.BN,12);
+  const cSelSet=new Set();
+  for(let i=0;i<cfg.TM;i++) for(let j=0;j<cfg.TN;j++)
+    cSelSet.add((tR*cfg.TM+i)+","+(tC*cfg.TN+j));
+  function sampleHasC(sr,sc){
+    const r0=Math.floor(sr*cfg.BM/cRowSamples), r1=Math.floor((sr+1)*cfg.BM/cRowSamples);
+    const c0=Math.floor(sc*cfg.BN/cColSamples), c1=Math.floor((sc+1)*cfg.BN/cColSamples);
+    for(let r=r0;r<Math.max(r1,r0+1);r++)
+      for(let c=c0;c<Math.max(c1,c0+1);c++)
+        if(cSelSet.has(r+","+c)) return true;
+    return false;
+  }
+  let cHtml="";
+  $("ctile").style.gridTemplateColumns=`repeat(${cColSamples},minmax(0,1fr))`;
+  for(let r=0;r<cRowSamples;r++){
+    for(let c=0;c<cColSamples;c++){
+      const r0=Math.floor(r*cfg.BM/cRowSamples), c0=Math.floor(c*cfg.BN/cColSamples);
+      const valid=(b.y*cfg.BM+r0<cfg.M)&&(b.x*cfg.BN+c0<cfg.N);
+      const mine=sampleHasC(r,c);
+      cHtml+=`<div class="cell ${mine?'sel':valid?'valid':'invalid'}" title="C[${b.y*cfg.BM+r0}..][${b.x*cfg.BN+c0}..]">${mine?'●':valid?'C':'0'}</div>`;
+    }
+  }
+  $("ctile").innerHTML=cHtml;
+
+  // ---------- 写回映射 ----------
+  let wbMapHtml="";
+  $("writebackMap").style.gridTemplateColumns=`repeat(${Math.min(cfg.TN,8)},minmax(0,1fr))`;
+  for(let i=0;i<Math.min(cfg.TM,8);i++){
+    for(let j=0;j<Math.min(cfg.TN,8);j++){
+      const row=gRow()+i, col=gCol()+j;
+      const ok=row<cfg.M && col<cfg.N;
+      wbMapHtml+=`<div class="cell tmp-sel" title="tmp[${i}][${j}] → C[${row}][${col}]">t${i}${j}<br>→C${row},${col}${ok?'':'✗'}</div>`;
+    }
+  }
+  $("writebackMap").innerHTML=wbMapHtml;
+}
+
+function renderTiling(){
+  $("tilingExplanation").innerHTML=`
+  <h3>2D Thread Tile：A/B 加载方向 + 外积累加</h3>
+  <div class="tile-diagram">数据流：Global A/B → Shared As/Bs → aReg/bReg → tmp → Global C
+
+【A 加载：列固定，沿行跨步】
+  STRIDE_A = NUM_THREADS / BK
+  inner_row_A = threadIdx.x / BK, inner_col_A = threadIdx.x % BK
+  for k = 0..(BM/STRIDE_A - 1):
+    aRow = inner_row_A + k*STRIDE_A   // 行变化，列固定
+    As[aRow*BK + inner_col_A] =
+      (c_row*BM + aRow < M && bkIdx + inner_col_A < K)
+        ? A[aRow*K + inner_col_A] : 0
+
+【B 加载：列固定，沿行跨步】
+  STRIDE_B = NUM_THREADS / BN
+  inner_row_B = threadIdx.x / BN, inner_col_B = threadIdx.x % BN
+  for k = 0..(BK/STRIDE_B - 1):
+    bRow = inner_row_B + k*STRIDE_B   // 行变化，列固定
+    Bs[bRow*BN + inner_col_B] =
+      (bkIdx + bRow < K && c_col*BN + inner_col_B < N)
+        ? B[bRow*N + inner_col_B] : 0
+
+  注意：A 和 B 都是“列固定、沿行跳着搬”。区别只是：
+    A tile 行多（BM=32），STRIDE_A=8，每线程跨 8 行取 4 个；
+    B tile 行少（BK=8），STRIDE_B=2，每线程跨 2 行取 4 个。
+
+【外积累加：aReg 按列取，bReg 按行取】
+  for dotIdx = 0 .. BK-1:
+    aReg[i] = As[(thread_row*TM + i)*BK + dotIdx]   // 固定列 dotIdx，取 TM 行
+    bReg[j] = Bs[dotIdx*BN + thread_col*TN + j]     // 固定行 dotIdx，取 TN 列
+    tmp[i][j] += aReg[i] * bReg[j]                  // TM×TN 外积
+
+【写回】
+  for i, j:
+    if (gRow+i < M && gCol+j < N)
+      C[(thread_row*TM+i)*N + (thread_col*TN+j)] = tmp[i][j]
+</div>
+  <div class="explain-box">
+    <b>为什么 A 和 B 都是跨行？</b> 因为加载循环的 offset 加在行索引上（aRow / bRow），列索引（inner_col_A / inner_col_B）保持不变。
+    视觉上 A tile 竖长（32×8），跨行像“竖向跳”；B tile 横宽（8×32），跨行像“竖向跳但只跳 8 行内的 4 个点”。
+  </div>
+  <div class="explain-box good">
+    <b>外积的取值方向</b>：aReg 按列取（固定 K 列 dotIdx，取 M 方向 TM 行），bReg 按行取（固定 K 行 dotIdx，取 N 方向 TN 列），
+    所以是 (TM×1) × (1×TN) 的外积。A 元素被 TN 个输出复用，B 元素被 TM 个输出复用。
+  </div>`;
+}
+
+function renderCode(){
+  const code=`// 2D Thread Tile + Shared Memory
+const uint c_row = blockIdx.y;
+const uint c_col = blockIdx.x;
+
+const uint thread_col = threadIdx.x % THREAD_COLS;  // THREAD_COLS = BN/TN
+const uint thread_row = threadIdx.x / THREAD_COLS;
+
+const uint inner_row_A = threadIdx.x / BK;
+const uint inner_col_A = threadIdx.x % BK;
+const uint inner_row_B = threadIdx.x / BN;
+const uint inner_col_B = threadIdx.x % BN;
+
+const uint gRow = c_row * BM + thread_row * TM;
+const uint gCol = c_col * BN + thread_col * TN;
+
+__shared__ float As[BM * BK];
+__shared__ float Bs[BK * BN];
+
+A += c_row * BM * K;
+B += c_col * BN;
+C += c_row * BM * N + c_col * BN;
+
+float tmp[TM][TN] = {0};
+
+for (int bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // A: 列固定 inner_col_A，沿行跨 STRIDE_A
+    for (uint offset = 0; offset < BM; offset += STRIDE_A) {
+        const uint aRow = inner_row_A + offset;
+        const uint aCol = inner_col_A;
+        const bool valid = (c_row*BM + aRow < M) && (bkIdx + aCol < K);
+        As[aRow * BK + aCol] = valid ? A[aRow * K + aCol] : 0.0f;
+    }
+    // B: 列固定 inner_col_B，沿行跨 STRIDE_B
+    for (uint offset = 0; offset < BK; offset += STRIDE_B) {
+        const uint bRow = inner_row_B + offset;
+        const uint bCol = inner_col_B;
+        const bool valid = (bkIdx + bRow < K) && (c_col*BN + bCol < N);
+        Bs[bRow * BN + bCol] = valid ? B[bRow * N + bCol] : 0.0f;
+    }
+
+    __syncthreads();
+
+    // 外积：aReg 按列取，bReg 按行取
+    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+        float aReg[TM], bReg[TN];
+        for (int i = 0; i < TM; ++i)
+            aReg[i] = As[(thread_row*TM + i)*BK + dotIdx];
+        for (int j = 0; j < TN; ++j)
+            bReg[j] = Bs[dotIdx*BN + thread_col*TN + j];
+        for (int i = 0; i < TM; ++i)
+            for (int j = 0; j < TN; ++j)
+                tmp[i][j] += aReg[i] * bReg[j];
+    }
+
+    __syncthreads();
+    A += BK;
+    B += BK * N;
+}
+
+for (int i = 0; i < TM; ++i)
+    for (int j = 0; j < TN; ++j) {
+        const uint row = gRow + i;
+        const uint col = gCol + j;
+        if (row < M && col < N)
+            C[(thread_row*TM + i)*N + (thread_col*TN + j)] = tmp[i][j];
+    }`;
+  $("code").innerHTML=`<pre>${code.replaceAll("&","&amp;").replaceAll("<","&lt;")}</pre>
+  <p class="small">A、B 加载都是列固定、沿行跨步；STRIDE_A=NUM_THREADS/BK，STRIDE_B=NUM_THREADS/BN。外积阶段 aReg 按列取（固定 dotIdx）、bReg 按行取（固定 dotIdx）。</p>`;
+}
+
+document.addEventListener("click",e=>{
+  let s=e.target.closest("[data-stage]");
+  if(s){stage=+s.dataset.stage;render();return}
+  let b=e.target.closest("[data-block]");
+  if(b){let [x,y]=b.dataset.block.split(",").map(Number);block={x,y};render();return}
+  let t=e.target.closest("[data-thread]");
+  if(t){thread.x=+t.dataset.thread;render();return}
+});
+
+$("prev").onclick=()=>{stage=Math.max(0,stage-1);render()};
+$("next").onclick=()=>{
+  if(stage===3){
+    if(curDotIdx+1<cfg.BK){curDotIdx++;render();return;}
+  }
+  if(stage===5){
+    if(kTile+1<Math.ceil(cfg.K/cfg.BK)){kTile++;stage=1;curDotIdx=0;}
+    else stage=6;
+  } else stage=Math.min(maxStage(),stage+1);
+  render();
+};
+$("reset").onclick=()=>{stage=0;curDotIdx=0;render()};
+
+$("apply").onclick=()=>{
+  let M=+$("M").value,N=+$("N").value,K=+$("K").value;
+  let BM=+$("BM").value,BN=+$("BN").value,BK=+$("BK").value,TM=+$("TM").value,TN=+$("TN").value;
+  if(![M,N,K,BM,BN,BK,TM,TN].every(Number.isInteger)||
+     M<1||N<1||K<1||BM<2||BN<2||BK<2||TM<1||TN<1){
+    alert("请输入有效尺寸。");return;
+  }
+  if(BM%TM!==0||BN%TN!==0){
+    alert("要求 BM%TM==0 且 BN%TN==0。");return;
+  }
+  const NT=(BM*BN)/(TM*TN);
+  if(!Number.isInteger(NT)||NT%BK!==0||NT%BN!==0){
+    alert(`NUM_THREADS=(BM*BN)/(TM*TN)=${NT}，要求 NUM_THREADS%BK==0 且 NUM_THREADS%BN==0。`);return;
+  }
+  cfg={M,N,K,BM,BN,BK,TM,TN};
+  block={x:0,y:0};thread={x:0};stage=0;kTile=0;curDotIdx=0;
+  render();
+};
+
+render();
+</script>
+</body></html>

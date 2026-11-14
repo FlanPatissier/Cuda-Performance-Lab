@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA Matrix Multiplication Visualizer</title>
+<style>
+:root{--bg:#0b1020;--panel:#141c30;--panel2:#1b2740;--line:#2c3a56;--text:#e9efff;--muted:#a8b5d1;--blue:#63a8ff;--orange:#ffbf69;--green:#59d6a2;--red:#ff8585}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{padding:24px max(20px,calc((100vw - 1240px)/2));background:linear-gradient(120deg,#142443,#101729);border-bottom:1px solid var(--line)}
+h1{margin:0 0 6px;font-size:26px}h2{font-size:19px;margin:0 0 12px}h3{font-size:16px;margin:0 0 8px}.sub{color:var(--muted)}
+main{max-width:1240px;margin:22px auto;padding:0 18px 50px;display:grid;gap:16px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end}
+label{display:grid;gap:4px;color:var(--muted);font-size:13px}
+input,select,button{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 11px;font:inherit}
+input{width:90px}button{cursor:pointer}button:hover{border-color:var(--blue)}button.primary{background:#1b4778;border-color:#367dc3}
+.tabs{display:flex;gap:8px;flex-wrap:wrap}.tabs button.active{background:#244d7c;border-color:var(--blue)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.kpi{background:var(--panel2);padding:10px;border-radius:10px}.kpi b{display:block;font-size:19px}
+.small{font-size:13px;color:var(--muted)}.formula{font-family:ui-monospace,Consolas,monospace;background:#0d1526;border:1px solid var(--line);padding:10px;border-radius:9px;overflow-wrap:anywhere}
+table{border-collapse:collapse;width:100%;font-size:12px}td,th{border:1px solid var(--line);padding:5px;text-align:center}th{color:var(--muted);background:#10192b}
+.matrix{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:3px}.cell{background:#202d45;border-radius:4px;text-align:center;padding:5px 1px;font:11px ui-monospace,monospace;color:#cbd8f3;min-width:0}.cell.sel{outline:2px solid var(--green);background:#245a50}.cell.valid{background:#23466b}.cell.invalid{background:#54343a;color:#ffd0d0}
+.steps{display:flex;gap:5px;flex-wrap:wrap}.steps button{font-size:12px;padding:6px 9px}.steps button.active{border-color:var(--green);background:#19483f}
+.badge{display:inline-block;border-radius:99px;padding:2px 8px;background:#263752;color:#cfe2ff;font-size:12px}.good{color:var(--green)}.warn{color:var(--orange)}.bad{color:var(--red)}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0d1526;border:1px solid var(--line);border-radius:9px;padding:12px;margin:8px 0;font:12px/1.55 ui-monospace,Consolas,monospace}
+.pointer-advance{background:#0d1526;border:1px solid var(--line);padding:12px;border-radius:9px;font-family:ui-monospace,Consolas,monospace}
+.pointer-advance .step{display:flex;gap:10px;margin-bottom:8px;align-items:center}
+.pointer-advance .step-num{background:#244d7c;color:white;border-radius:50%;width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
+@media(max-width:850px){.grid2,.grid3{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header><h1>CUDA Matrix Multiplication Visualizer</h1><div class="sub">逐 Block、逐 Thread 追踪 naive 与 shared-memory kernel · 中文交互教学版</div></header>
+<main>
+<section class="panel">
+<h2>1. 配置实验</h2>
+<div class="controls">
+<label>M（A 行数 / C 行数）<input id="M" type="number" min="1" max="128" value="64"></label>
+<label>N（B 列数 / C 列数）<input id="N" type="number" min="1" max="128" value="64"></label>
+<label>K（A 列数 / B 行数）<input id="K" type="number" min="1" max="128" value="64"></label>
+<label>BLOCKSIZE<input id="BS" type="number" min="2" max="32" value="8"></label>
+<button class="primary" id="apply">应用配置</button>
+</div>
+<p class="small">默认 M=N=K=64、BLOCKSIZE=8：grid 为 8×8，共 64 个 Block；每个 Block 有 8×8=64 个线程。为了让边界情况更直观，可以把 M/N/K 改成非 8 倍数，例如 50、45、37。BLOCKSIZE 控制在 8 以下可让线程网格和 Tile 可视化更清晰。</p>
+<div class="kpis" id="kpis"></div>
+</section>
+
+<section class="panel">
+<h2>2. 选择 Kernel 与执行阶段</h2>
+<div class="tabs"><button data-mode="naive">Naive Kernel</button><button data-mode="shared" class="active">Shared Memory Kernel</button></div>
+<div class="steps" id="steps" style="margin-top:12px"></div>
+<div class="controls" style="margin-top:12px">
+<button id="prev">← 上一步</button><button class="primary" id="next">下一步 →</button><button id="reset">重置阶段</button>
+<span class="small" id="stageCounter"></span>
+</div>
+<div id="stageDesc" style="margin-top:12px"></div>
+</section>
+
+<section class="panel">
+<h2>3. Grid / Block / Thread 导航</h2>
+<div class="grid2">
+<div>
+<h3>Grid 中的 Block</h3><div id="blockGrid" class="matrix"></div>
+<p class="small">点击 Block 选择它。每个小格代表一个 Block，横向坐标是 blockIdx.x，纵向坐标是 blockIdx.y。</p>
+</div>
+<div>
+<h3>当前 Block 的 Thread（BS×BS）</h3><div id="threadGrid" class="matrix"></div>
+<p class="small">点击任意 Thread，右侧会显示 threadIdx.x、threadRow、threadCol、全局坐标和内存访问。Thread 索引按一维排列：threadIdx.x = threadRow×BLOCKSIZE + threadCol。</p>
+</div>
+</div>
+</section>
+
+<section class="panel">
+<h2>4. 当前 Block / Thread 的精确计算过程</h2>
+<div class="kpis" id="threadKpis"></div>
+<div class="grid2" style="margin-top:12px">
+<div><h3>坐标映射与输出位置</h3><div id="mapping"></div></div>
+<div><h3>当前阶段的操作</h3><div id="operation"></div></div>
+</div>
+<div style="margin-top:12px"><h3>Shared Memory 的加载判断（shared 模式）</h3><div id="loads"></div></div>
+<div style="margin-top:12px"><h3>tmp 累加 / K 循环</h3><div id="accum"></div></div>
+<div style="margin-top:12px"><h3>指针推进与边界（新增）</h3><div id="pointerAdvance" class="pointer-advance"></div></div>
+<div style="margin-top:12px"><h3>最终写回 C</h3><div id="writeback"></div></div>
+</section>
+
+<section class="panel">
+<h2>5. 当前 Block 的 Tile 与边界可视化</h2>
+<div class="grid3">
+<div><h3>A Tile（As）</h3><div id="atile" class="matrix"></div><p class="small">蓝色=有效加载；红色=越界补 0。</p></div>
+<div><h3>B Tile（Bs）</h3><div id="btile" class="matrix"></div><p class="small">橙色=有效加载；红色=越界补 0。</p></div>
+<div><h3>C 输出 Tile</h3><div id="ctile" class="matrix"></div><p class="small">绿色=当前选中线程负责的输出位置。</p></div>
+</div>
+</section>
+<section class="panel">
+<h2>6. 关键代码对照</h2><div id="code"></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let cfg={M:64,N:64,K:64,BS:8}, mode="shared", stage=0, kTile=0, block={x:0,y:0}, thread={r:0,c:0};
+const naiveStages=["线程映射","读取 A 与 B","乘加累积","写回 C"];
+const sharedStages=["Block / Thread 坐标映射","加载 A、B Tile","第一次 __syncthreads()","当前 Tile 的乘加累积","第二次 __syncthreads()","推进 K 到下一个 Tile","写回 C"];
+const clamp=(x,a,b)=>Math.max(a,Math.min(b,x));
+function gridX(){return Math.ceil(cfg.N/cfg.BS)} function gridY(){return Math.ceil(cfg.M/cfg.BS)}
+function tx(){return thread.r*cfg.BS+thread.c}
+function coords(){let gRow=block.y*cfg.BS+thread.r,gCol=block.x*cfg.BS+thread.c;return {gRow,gCol,tid:tx(),aColBase:0,bRowBase:0}}
+function maxStage(){return (mode==="shared"?sharedStages:naiveStages).length-1}
+function stageName(){return (mode==="shared"?sharedStages:naiveStages)[stage]}
+function render(){
+  $("kpis").innerHTML=[["Grid",`${gridX()} × ${gridY()}`],["Block 数",gridX()*gridY()],["每 Block 线程数",cfg.BS*cfg.BS],["K Tile 轮数",Math.ceil(cfg.K/cfg.BS)]].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+  document.querySelectorAll("[data-mode]").forEach(b=>b.classList.toggle("active",b.dataset.mode===mode));
+  let names=mode==="shared"?sharedStages:naiveStages;
+  $("steps").innerHTML=names.map((n,i)=>`<button data-stage="${i}" class="${i===stage?"active":""}">${i+1}. ${n}</button>`).join("");
+  $("stageCounter").textContent=`阶段 ${stage+1}/${names.length}：${stageName()}`;
+  $("stageDesc").innerHTML=description();
+  // Grid 中 Block 展示（限制最多 8x8 可视）
+  const maxGridShow = 8;
+  $("blockGrid").style.gridTemplateColumns=`repeat(${Math.min(gridX(),maxGridShow)},minmax(0,1fr))`;
+  $("blockGrid").innerHTML=Array.from({length:gridX()*gridY()},(_,i)=>{
+    let x=i%gridX(),y=Math.floor(i/gridX());
+    // 超过显示范围的可跳过（此处简化直接全显示）
+    let sel=x===block.x&&y===block.y;
+    return `<button class="cell ${sel?"sel":""}" data-block="${x},${y}">B(${x},${y})<br>C tile</button>`
+  }).join("");
+  // Thread 网格：BS 较大时限制可视化尺寸（最多显示 8×8 个格子）
+  const threadShow = Math.min(cfg.BS, 8);
+  $("threadGrid").style.gridTemplateColumns=`repeat(${threadShow},minmax(0,1fr))`;
+  $("threadGrid").innerHTML=Array.from({length:threadShow*threadShow},(_,i)=>{
+    let r=Math.floor(i/threadShow),c=i%threadShow;
+    let sel=r===thread.r&&c===thread.c;
+    let label = cfg.BS>8 ? `${r*cfg.BS/threadShow|0},${c*cfg.BS/threadShow|0}` : `${i}`;
+    return `<button class="cell ${sel?"sel":""}" data-thread="${r*cfg.BS/threadShow|0},${c*cfg.BS/threadShow|0}">${label}<br>(${r*cfg.BS/threadShow|0},${c*cfg.BS/threadShow|0})</button>`
+  }).join("");
+  renderDetails();renderTiles();renderCode();
+}
+function description(){
+ let s=stageName(),b=block,t=thread,p=coords(),k=kTile,bk=k*cfg.BS;
+ if(mode==="naive"){
+ const texts=[
+ `Block (${b.x},${b.y}) 的二维 blockDim 在 naive kernel 中是 (${cfg.BS},${cfg.BS})。Thread (${t.r},${t.c}) 对应 threadIdx.x=${t.c}、threadIdx.y=${t.r}，负责 C[${p.gRow}][${p.gCol}]。`,
+ `这个线程执行 for(k=0;k<K;k++)：读取 A[${p.gRow}][k] 和 B[k][${p.gCol}]。注意单个线程沿 k 读取 B 时地址跨越 N 个 float。`,
+ `sum 初始为 0。每轮执行 sum += A[${p.gRow}][k] * B[k][${p.gCol}]，共 K=${cfg.K} 轮。线程之间不需要共享 sum。`,
+ `若 row<M 且 col<N，写入 C[${p.gRow}][${p.gCol}] = sum；否则该线程不写入，避免越界。`];
+ return `<p>${texts[stage]}</p>`;
+ }
+ const texts=[
+ `cRow=blockIdx.y=${b.y}，cCol=blockIdx.x=${b.x}。threadIdx.x=${p.tid}。threadCol=${p.tid}%${cfg.BS}=${t.c}；threadRow=${p.tid}/${cfg.BS} 向下取整=${t.r}。因此该线程在本 Block Tile 内的位置为 (${t.r},${t.c})。`,
+ `当前 K Tile 起点 bkIdx=${bk}。As[${t.r}][${t.c}] 从 A[${p.gRow}][${bk+t.c}] 加载；Bs[${t.r}][${t.c}] 从 B[${bk+t.r}][${p.gCol}] 加载。每个线程协作加载 A、B 各一个元素。`,
+ `所有线程都必须完成 As、Bs 的写入。__syncthreads() 建立 Block 内同步，确保接下来的读取不会读到尚未写好的数据。`,
+ `当前线程计算 tmp += As[${t.r}][dotIdx] × Bs[dotIdx][${t.c}]。dotIdx=0...${cfg.BS-1}。本轮 K Tile 贡献 ${cfg.BS} 次乘加；最后一个 Tile 中超出 K 的部分已在加载时补 0。`,
+ `本轮 As、Bs 已经被所有线程读取完毕。第二次 __syncthreads() 防止快线程提前覆盖共享内存，而慢线程还在读取旧 Tile。`,
+ `A 指针加 ${cfg.BS}，即切到下一组 K 列；B 指针加 ${cfg.BS}×N=${cfg.BS*cfg.N}，即切到下一组 K 行。当前 bkIdx=${bk}，下一轮 bkIdx=${bk+cfg.BS}。通过 K Tile 下拉框可以检查每一轮，直到 bkIdx>=K。`,
+ `如果 gRow<M 且 gCol<N，写入 C[${p.gRow}][${p.gCol}] = tmp。边缘 Block 中越界线程不写回。`];
+ return `<p>${texts[stage]}</p>`;
+}
+function renderDetails(){
+ let p=coords(),b=block,t=thread,tid=p.tid,BS=cfg.BS,bk=(stage===5?BS:0);
+ $("threadKpis").innerHTML=[["blockIdx",`(${b.x}, ${b.y})`],["threadIdx.x",tid],["threadRow / Col",`${t.r} / ${t.c}`],["全局 C 坐标",`(${p.gRow}, ${p.gCol})`]].map(x=>`<div class="kpi"><span class="small">${x[0]}</span><b>${x[1]}</b></div>`).join("");
+ $("mapping").innerHTML=`<div class="formula">cRow = blockIdx.y = ${b.y}<br>cCol = blockIdx.x = ${b.x}<br>threadCol = threadIdx.x % BLOCKSIZE = ${tid} % ${BS} = ${t.c}<br>threadRow = threadIdx.x / BLOCKSIZE = floor(${tid}/${BS}) = ${t.r}<br>gRow = cRow × ${BS} + threadRow = ${b.y*BS+t.r}<br>gCol = cCol × ${BS} + threadCol = ${b.x*BS+t.c}</div>`;
+ $("operation").innerHTML=`<div class="formula">输出元素：C[${p.gRow}][${p.gCol}]<br>一维线程编号：${tid} = ${t.r} × ${BS} + ${t.c}<br>Block 覆盖行：[${b.y*BS}, ${Math.min((b.y+1)*BS,cfg.M)-1}]<br>Block 覆盖列：[${b.x*BS}, ${Math.min((b.x+1)*BS,cfg.N)-1}]</div>`;
+ let bkIdx=kTile*BS,ar=p.gRow,ac=bkIdx+t.c,br=bkIdx+t.r,bc=p.gCol;
+ let aok=ar<cfg.M&&ac<cfg.K,bok=br<cfg.K&&bc<cfg.N;
+ $("loads").innerHTML=mode==="shared"?`<div class="formula">As[threadRow × BS + threadCol] = As[${t.r}×${BS}+${t.c}] = As[${t.r*BS+t.c}]<br>判断 A：gRow<M → ${ar}<${cfg.M} 为 ${ar<cfg.M}；bkIdx+threadCol<K → ${ac}<${cfg.K} 为 ${ac<cfg.K}<br>结果：${aok?`读取 A[${ar}][${ac}]`:"补 0（A 越界）"}<hr>Bs[threadRow × BS + threadCol] = Bs[${t.r*BS+t.c}]<br>判断 B：bkIdx+threadRow<K → ${br}<${cfg.K} 为 ${br<cfg.K}；gCol<N → ${bc}<${cfg.N} 为 ${bc<cfg.N}<br>结果：${bok?`读取 B[${br}][${bc}]`:"补 0（B 越界）"}</div><p class="small">A 的 K 边界检查控制列；B 的 K 边界检查控制行；N 检查控制 B 的列。M 检查控制 A 的行。补 0 让 Tile 尺寸固定，并让无效位置对点积贡献为 0。</p>`:"<p class='small'>Naive kernel 不使用 As/Bs，因此没有这两条 Shared Memory 加载语句。它通过 if(row<M && col<N) 保护输出，并在 k 循环中读取 A、B。</p>";
+ $("accum").innerHTML=mode==="shared"?`<div class="formula">tmp 初始值 = 0<br>tmp = Σ(dotIdx=0...${BS-1}) As[${t.r}][dotIdx] × Bs[dotIdx][${t.c}]<br>对应全局数据：A[${p.gRow}][bkIdx+dotIdx] × B[bkIdx+dotIdx][${p.gCol}]<br>当前 K Tile：bkIdx=${bkIdx}，处理 k=${bkIdx}...${Math.min(bkIdx+BS-1,cfg.K-1)}<br>总 Tile 轮数：ceil(K/BS) = ${Math.ceil(cfg.K/BS)}</div>`:`<div class="formula">sum 初始值 = 0<br>for k = 0 ... ${cfg.K-1}<br>sum += A[${p.gRow}][k] × B[k][${p.gCol}]<br>完成 ${cfg.K} 次乘加后得到 C[${p.gRow}][${p.gCol}]</div>`;
+
+ // 新增：指针推进详细展示
+ if(mode==="shared"){
+   let tileIdx = kTile;
+   let aPtrBase = `A + blockIdx.y*BS*K + k*BS`; // 简化示意
+   let bPtrBase = `B + k*BS*N + blockIdx.x*BS`;
+   let aOffset = `As 加载：A[${p.gRow}][${bkIdx} + threadCol]`;
+   let bOffset = `Bs 加载：B[${bkIdx} + threadRow][${p.gCol}]`;
+   let nextA = `A 指针 += ${BS}（下一组 K 列）`;
+   let nextB = `B 指针 += ${BS}×N = ${BS*cfg.N}（下一组 K 行）`;
+   let curBk = bkIdx;
+   let nextBk = Math.min(bkIdx+BS, cfg.K);
+   let done = curBk>=cfg.K;
+   $("pointerAdvance").innerHTML = `
+     <div class="step"><span class="step-num">1</span> <span>当前 K Tile 索引 <b>bkIdx = ${curBk}</b>；A 加载起始列 = ${curBk}，B 加载起始行 = ${curBk}</span></div>
+     <div class="step"><span class="step-num">2</span> <span>As 加载：A[gRow][bkIdx + threadCol] = A[${p.gRow}][${curBk} + ${t.c}]</span></div>
+     <div class="step"><span class="step-num">3</span> <span>Bs 加载：B[bkIdx + threadRow][gCol] = B[${curBk} + ${t.r}][${p.gCol}]</span></div>
+     <div class="step"><span class="step-num">4</span> <span>K Tile 循环计算完毕后，指针推进：<br> 
+       A 指针 += ${BS}（即下一轮 bkIdx = ${nextBk}）<br>
+       B 指针 += ${BS}×N = ${BS*cfg.N}（行偏移）<br>
+       ${nextBk >= cfg.K ? '<span class="bad">已到达 K 末尾，K 循环结束</span>' : `<span class="good">下一轮 bkIdx = ${nextBk}</span>`}
+     </span></div>
+     <div class="step"><span class="step-num">5</span> <span>总共需要 ${Math.ceil(cfg.K/BS)} 轮 K Tile，当前第 ${Math.min(tileIdx+1, Math.ceil(cfg.K/BS))} 轮。</span></div>
+   `;
+ } else {
+   $("pointerAdvance").innerHTML = `<div class="step"><span class="step-num">•</span><span>Naive kernel 中每个线程独立循环 k=0..K-1，A 指针每次 +=1，B 指针每次 +=N。无需 Block 级同步。</span></div>`;
+ }
+
+ $("writeback").innerHTML=`<div class="formula">条件：gRow<M && gCol<N<br>${p.gRow}<${cfg.M} && ${p.gCol}<${cfg.N} → ${p.gRow<cfg.M&&p.gCol<cfg.N}<br>写回地址：C + threadRow×N + threadCol<br>= C + ${t.r}×${cfg.N} + ${t.c}<br>= C + ${t.r*cfg.N+t.c}（相对当前 Block 的 C 指针）<br>全局元素：C[${p.gRow}][${p.gCol}]</div>`;
+}
+function renderTiles(){
+ let b=block,t=thread,BS=cfg.BS,bk=kTile*BS;
+ // 对于显示网格，如果 BS>8，则每格代表多个元素；这里简化：最多显示 8×8 采样
+ const showN = Math.min(BS, 8);
+ const make=(kind)=>Array.from({length:showN*showN},(_,i)=>{
+   let n=showN, r=Math.floor(i/n), c=i%n;
+   // 映射回原始 tile 坐标（若 BS>8，则步长 >1）
+   let rr = Math.floor(r * BS / showN);
+   let cc = Math.floor(c * BS / showN);
+   let valid, sel = rr === t.r && cc === t.c, label;
+   if(kind==="A"){
+     valid = b.y*BS+rr < cfg.M && bk+cc < cfg.K;
+     label = `${b.y*BS+rr},${bk+cc}`;
+   } else if(kind==="B"){
+     valid = bk+rr < cfg.K && b.x*BS+cc < cfg.N;
+     label = `${bk+rr},${b.x*BS+cc}`;
+   } else {
+     valid = b.y*BS+rr < cfg.M && b.x*BS+cc < cfg.N;
+     label = `${b.y*BS+rr},${b.x*BS+cc}`;
+   }
+   return `<div class="cell ${sel?"sel":valid?(kind==="A"?"valid":""):"invalid"}" title="${kind}[${label}]">${kind==="C"?(sel?"●":"C"):valid?(kind==="A"?"A":"B"):"0"}</div>`
+ }).join("");
+ ["atile","btile","ctile"].forEach((id,i)=>{let kind=["A","B","C"][i];$(id).innerHTML=make(kind)});
+}
+function renderCode(){
+ const sharedCode=`const int cRow = blockIdx.y;\\nconst int cCol = blockIdx.x;\\nconst int threadCol = threadIdx.x % BLOCKSIZE;\\nconst int threadRow = threadIdx.x / BLOCKSIZE;\\nconst int gRow = cRow * BLOCKSIZE + threadRow;\\nconst int gCol = cCol * BLOCKSIZE + threadCol;\\n\\nAs[threadRow * BLOCKSIZE + threadCol] =\\n  (gRow < M && bkIdx + threadCol < K)\\n    ? A[threadRow * K + threadCol] : 0.0f;\\nBs[threadRow * BLOCKSIZE + threadCol] =\\n  (bkIdx + threadRow < K && gCol < N)\\n    ? B[threadRow * N + threadCol] : 0.0f;\\n\\n__syncthreads();\\nfor (int dotIdx=0; dotIdx<BLOCKSIZE; ++dotIdx)\\n  tmp += As[threadRow*BLOCKSIZE+dotIdx] *\\n         Bs[dotIdx*BLOCKSIZE+threadCol];\\n__syncthreads();\\n\\nC[threadRow * N + threadCol] = tmp;`;
+ const naiveCode=`int col = blockIdx.x * blockDim.x + threadIdx.x;\\nint row = blockIdx.y * blockDim.y + threadIdx.y;\\nif (row < M && col < N) {\\n  float sum = 0.0f;\\n  for (int k=0; k<K; ++k)\\n    sum += A[row*K+k] * B[k*N+col];\\n  C[row*N+col] = sum;\\n}`;
+ $("code").innerHTML=`<pre>${(mode==="shared"?sharedCode:naiveCode).replaceAll("&","&amp;").replaceAll("<","&lt;")}</pre><p class="small">代码片段来自本次分析的 kernel。注意：shared kernel 的 A/B 指针已先按 block 的起始位置偏移，因此局部索引与全局坐标需要结合指针偏移一起理解。</p>`;
+}
+document.addEventListener("click",e=>{
+ let m=e.target.closest("[data-mode]");if(m){mode=m.dataset.mode;stage=0;kTile=0;render();return}
+ let s=e.target.closest("[data-stage]");if(s){stage=+s.dataset.stage;render();return}
+ let b=e.target.closest("[data-block]");if(b){let [x,y]=b.dataset.block.split(",").map(Number);block={x,y};render();return}
+ let t=e.target.closest("[data-thread]");if(t){let [r,c]=t.dataset.thread.split(",").map(Number);thread={r,c};render();return}
+});
+$("prev").onclick=()=>{stage=Math.max(0,stage-1);render()};
+$("next").onclick=()=>{
+ if(mode==="shared" && stage===5){
+   if(kTile+1<Math.ceil(cfg.K/cfg.BS)){kTile++;stage=1;}
+   else stage=6;
+ } else stage=Math.min(maxStage(),stage+1);
+ render();
+};
+$("kTile").onchange=e=>{kTile=+e.target.value;render()};
+$("reset").onclick=()=>{stage=0;render()};
+$("apply").onclick=()=>{let M=+$("M").value,N=+$("N").value,K=+$("K").value,BS=+$("BS").value;if(![M,N,K,BS].every(Number.isInteger)||M<1||N<1||K<1||BS<2||BS>32){alert("请输入有效尺寸：M/N/K 为 1–128，BLOCKSIZE 为 2–32。");return}cfg={M,N,K,BS};block={x:0,y:0};thread={r:0,c:0};stage=0;kTile=0;render()};
+render();
+</script>
+</body></html>
